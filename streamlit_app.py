@@ -19,9 +19,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("התאמות לקוחות – OV/RC + הוראות קבע (VLOOKUP קבוע)")
-st.caption("מעלים קובץ אקסל מקור ומקבלים קובץ מעובד עם מס' התאמה, גיליון 'הוראת קבע ספקים', צביעה ושורת סיכום 20001.")
 
-# -------- כללי VLOOKUP קבועים (מורחבים) --------
+# -------- כללי VLOOKUP קבועים (בסיס) --------
 RAW_NAME_MAP = {
     "בזק בינלאומי ב": 30006,
     "פרי ירוחם חב'": 34714,
@@ -51,12 +50,12 @@ RAW_NAME_MAP = {
     "פז קמעונאות וא": 34811,
     "הו\"ק הלו' רבית": 8004,
     "הו\"ק הלואה קרן": 23001,
-    # כללים כלליים שהיו
+    # כלליים
     "עיריית אשדוד": 30056,
     "ישראכרט מור": 34002,
 }
 
-DEFAULT_AMOUNT_MAP = {
+BASE_AMOUNT_MAP = {
     8520.0: 30247,    # שלמה טפר
     10307.3: 30038,   # נמרוד תבור עו"ד
 }
@@ -78,23 +77,25 @@ def normalize_text(s):
     t = t.replace("-", " ").replace("–", " ").replace("־", " ")
     return re.sub(r"\s+", " ", t).strip()
 
-# בונים מפה מנורמלת (להשוואה יציבה)
-DEFAULT_NAME_MAP = { normalize_text(k): v for k, v in RAW_NAME_MAP.items() }
+# ---------- ניהול כללים ב-session_state ----------
+if "name_map" not in st.session_state:
+    # נשמור מנורמל
+    st.session_state.name_map = { normalize_text(k): v for k, v in RAW_NAME_MAP.items() }
+if "amount_map" not in st.session_state:
+    st.session_state.amount_map = dict(BASE_AMOUNT_MAP)
 
-def ws_to_df(ws):
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows:
-        return pd.DataFrame()
-    header = None; start = 0
-    for i, r in enumerate(rows):
-        if any(x is not None for x in r):
-            header = [str(x).strip() if x is not None else "" for x in r]
-            start = i + 1
-            break
-    if header is None:
-        return pd.DataFrame()
-    data = [tuple(list(row)[:len(header)]) for row in rows[start:]]
-    return pd.DataFrame(data, columns=header)
+def rules_excel_bytes():
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="xlsxwriter") as w:
+        pd.DataFrame(
+            {"by_name": list(st.session_state.name_map.keys()),
+             "מס' ספק": list(st.session_state.name_map.values())}
+        ).to_excel(w, index=False, sheet_name="by_name")
+        pd.DataFrame(
+            {"סכום": list(st.session_state.amount_map.keys()),
+             "מס' ספק": list(st.session_state.amount_map.values())}
+        ).to_excel(w, index=False, sheet_name="by_amount")
+    return out.getvalue()
 
 def exact_or_contains(df, names):
     for n in names:
@@ -105,6 +106,19 @@ def exact_or_contains(df, names):
             if isinstance(c,str) and n in c:
                 return c
     return None
+
+def ws_to_df(ws):
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return pd.DataFrame()
+    header = None; start = 0
+    for i, r in enumerate(rows):
+        if any(x is not None for x in r):
+            header = [str(x).strip() if x is not None else "" for x in r]; start = i+1; break
+    if header is None:
+        return pd.DataFrame()
+    data = [tuple(list(row)[:len(header)]) for row in rows[start:]]
+    return pd.DataFrame(data, columns=header)
 
 def normalize_date(series):
     def f(x):
@@ -125,14 +139,12 @@ def process_workbook(xlsx_bytes):
     wb_in = load_workbook(io.BytesIO(xlsx_bytes), data_only=True, read_only=True)
 
     out_stream = io.BytesIO()
-    summary_rows = []
-    standing_rows = []
+    summary_rows, standing_rows = [], []
 
     with pd.ExcelWriter(out_stream, engine="xlsxwriter") as writer:
         for ws in wb_in.worksheets:
             df = ws_to_df(ws)
             df_save = df.copy()
-
             if df.empty:
                 pd.DataFrame().to_excel(writer, index=False, sheet_name=ws.title)
                 continue
@@ -158,7 +170,7 @@ def process_workbook(xlsx_bytes):
             _ref       = df[col_ref].astype(str).fillna("") if col_ref else pd.Series([""]*len(df))
             _details   = df[col_details].astype(str).fillna("") if col_details else pd.Series([""]*len(df))
 
-            # כלל 1: OV/RC -> 1
+            # OV/RC -> 1
             if all([col_bank_code, col_bank_amt, col_books_amt, col_ref, col_date]):
                 applied_ovrc = True
                 books_candidates = [
@@ -190,7 +202,7 @@ def process_workbook(xlsx_bytes):
                             used_books.add(chosen)
                             pairs += 1
 
-            # כלל 2: הוראות קבע 515/469 -> 2 + איסוף לגיליון
+            # Standing orders 515/469 -> 2
             if all([col_bank_code, col_details, col_bank_amt]):
                 applied_standing = True
                 for i in range(len(df)):
@@ -219,12 +231,12 @@ def process_workbook(xlsx_bytes):
             def map_supplier(name):
                 s = normalize_text(name)
                 # התאמה מדויקת
-                if s in DEFAULT_NAME_MAP:
-                    return DEFAULT_NAME_MAP[s]
-                # התאמה חלקית (contains), עדיפות למחרוזות ארוכות
-                for key in sorted(DEFAULT_NAME_MAP.keys(), key=len, reverse=True):
+                if s in st.session_state.name_map:
+                    return st.session_state.name_map[s]
+                # התאמה חלקית (contains) – עדיפות לביטויים ארוכים
+                for key in sorted(st.session_state.name_map.keys(), key=len, reverse=True):
                     if key and key in s:
-                        return DEFAULT_NAME_MAP[key]
+                        return st.session_state.name_map[key]
                 return ""
 
             st_df["מס' ספק"] = st_df["פרטים"].apply(map_supplier)
@@ -233,7 +245,7 @@ def process_workbook(xlsx_bytes):
                 if not row["מס' ספק"]:
                     if pd.notna(row["סכום"]):
                         val = round(abs(float(row["סכום"])), 2)
-                        return DEFAULT_AMOUNT_MAP.get(val, "")
+                        return st.session_state.amount_map.get(val, "")
                     return ""
                 return row["מס' ספק"]
 
@@ -269,7 +281,7 @@ def process_workbook(xlsx_bytes):
                 for c in range(1, ws.max_column+1):
                     ws.cell(row=r, column=c).fill = orange
 
-    # מחיקת שורות 20001 ישנות
+    # מחיקת 20001 ישנים
     dels = []
     for r in range(2, ws.max_row+1):
         v = ws.cell(row=r, column=col_supplier).value
@@ -301,7 +313,54 @@ def process_workbook(xlsx_bytes):
     wb_out.save(final_bytes)
     return final_bytes.getvalue(), pd.DataFrame(summary_rows)
 
-# ---------------- UI actions ----------------
+# ---------------- UI – עדכון כללים ----------------
+with st.expander("⚙️ עדכון – כללי VLOOKUP קבועים ומורחבים", expanded=False):
+    st.write("אפשר לעדכן מס' ספק לפי **פרטים** (שם) או לפי **סכום**. העדכון נשמר בזמן הריצה ומשפיע מיד על העיבוד.")
+    mode = st.radio("סוג עדכון", ["לפי פרטים (שם)", "לפי סכום"], horizontal=True)
+
+    if mode == "לפי פרטים (שם)":
+        name_input = st.text_input("פרטים (כמו שמופיע בדף הבנק)")
+        supplier_input = st.text_input("מס' ספק (יכול להיות גם טקסט, למשל 67-1)")
+        cols = st.columns([1,1,1])
+        if cols[0].button("➕ הוסף/עדכן"):
+            k = normalize_text(name_input)
+            if k and supplier_input:
+                st.session_state.name_map[k] = supplier_input
+                st.success(f"הכלל עודכן: '{k}' → {supplier_input}")
+        if cols[1].button("🗑️ מחיקה"):
+            k = normalize_text(name_input)
+            if k in st.session_state.name_map:
+                del st.session_state.name_map[k]
+                st.warning(f"הכלל נמחק: '{k}'")
+        st.dataframe(pd.DataFrame({"by_name": list(st.session_state.name_map.keys()),
+                                   "מס' ספק": list(st.session_state.name_map.values())}),
+                     use_container_width=True, height=240)
+
+    else:  # לפי סכום
+        amount_input = st.number_input("סכום (חיובי/שלילי – יישמר בערך מוחלט)", step=0.01, format="%.2f")
+        supplier_input2 = st.text_input("מס' ספק", key="amount_supplier")
+        cols = st.columns([1,1,1])
+        if cols[0].button("➕ הוסף/עדכן", key="add_amount"):
+            key_amt = round(abs(float(amount_input)), 2)
+            if key_amt and supplier_input2:
+                st.session_state.amount_map[key_amt] = supplier_input2
+                st.success(f"הכלל עודכן: {key_amt} → {supplier_input2}")
+        if cols[1].button("🗑️ מחיקה", key="del_amount"):
+            key_amt = round(abs(float(amount_input)), 2)
+            if key_amt in st.session_state.amount_map:
+                del st.session_state.amount_map[key_amt]
+                st.warning(f"הכלל נמחק: {key_amt}")
+        st.dataframe(pd.DataFrame({"סכום": list(st.session_state.amount_map.keys()),
+                                   "מס' ספק": list(st.session_state.amount_map.values())})
+                     .sort_values("סכום"), use_container_width=True, height=240)
+
+    st.download_button("⬇️ הורדת קובץ כללים מעודכן", data=rules_excel_bytes(),
+                       file_name="VLOOKUP_rules_updated.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+st.divider()
+
+# ---------------- עיבוד הקובץ ----------------
 uploaded = st.file_uploader("בחרי קובץ אקסל מקור (xlsx)", type=["xlsx"])
 
 if st.button("הרצה") and uploaded is not None:
@@ -314,4 +373,4 @@ if st.button("הרצה") and uploaded is not None:
                        file_name="התאמות_והוראת_קבע.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
-    st.info("VLOOKUP קבוע בקוד. העלי קובץ מקור ולחצי הרצה.")
+    st.caption("טיפ: אפשר לעדכן כללים למעלה – השינויים נשמרים בזמן הריצה ומשפיעים מיידית על התוצאות.")
