@@ -1,6 +1,6 @@
 # streamlit_app.py
 # -*- coding: utf-8 -*-
-import io, re
+import io, re, os, json
 from datetime import datetime
 
 import numpy as np
@@ -18,9 +18,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("התאמות לקוחות – OV/RC + הוראות קבע (VLOOKUP קבוע)")
+st.title("התאמות לקוחות – OV/RC + הוראות קבע (VLOOKUP קבוע + שמירה)")
 
-# -------- כללי VLOOKUP קבועים (בסיס) --------
+# -------- כללי VLOOKUP בסיסיים (default) --------
 RAW_NAME_MAP = {
     "בזק בינלאומי ב": 30006,
     "פרי ירוחם חב'": 34714,
@@ -54,7 +54,6 @@ RAW_NAME_MAP = {
     "עיריית אשדוד": 30056,
     "ישראכרט מור": 34002,
 }
-
 BASE_AMOUNT_MAP = {
     8520.0: 30247,    # שלמה טפר
     10307.3: 30038,   # נמרוד תבור עו"ד
@@ -69,6 +68,8 @@ REF_CANDS       = ["אסמכתא 1","אסמכתא1","אסמכתא","אסמכתה
 DATE_CANDS      = ["תאריך מאזן","תאריך ערך","תאריך"]
 DETAILS_CANDS   = ["פרטים","תיאור","שם ספק"]
 
+RULES_FILE = "rules_store.json"
+
 def normalize_text(s):
     if s is None:
         return ""
@@ -77,12 +78,37 @@ def normalize_text(s):
     t = t.replace("-", " ").replace("–", " ").replace("־", " ")
     return re.sub(r"\s+", " ", t).strip()
 
+# ---------- טעינה/שמירה מתמשכת ----------
+def load_rules_from_disk():
+    if os.path.exists(RULES_FILE):
+        try:
+            with open(RULES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # ניקוי/נרמול
+            name_map = { normalize_text(k): v for k, v in data.get("name_map", {}).items() }
+            amount_map = { float(k): v for k, v in data.get("amount_map", {}).items() }
+            return name_map, amount_map
+        except Exception:
+            pass
+    # אם אין קובץ – נחזיר בסיס
+    return { normalize_text(k): v for k, v in RAW_NAME_MAP.items() }, dict(BASE_AMOUNT_MAP)
+
+def save_rules_to_disk(name_map, amount_map):
+    try:
+        with open(RULES_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "name_map": name_map,
+                "amount_map": amount_map
+            }, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
 # ---------- ניהול כללים ב-session_state ----------
-if "name_map" not in st.session_state:
-    # נשמור מנורמל
-    st.session_state.name_map = { normalize_text(k): v for k, v in RAW_NAME_MAP.items() }
-if "amount_map" not in st.session_state:
-    st.session_state.amount_map = dict(BASE_AMOUNT_MAP)
+if "name_map" not in st.session_state or "amount_map" not in st.session_state:
+    nm, am = load_rules_from_disk()
+    st.session_state.name_map = nm
+    st.session_state.amount_map = am
 
 def rules_excel_bytes():
     out = io.BytesIO()
@@ -230,10 +256,8 @@ def process_workbook(xlsx_bytes):
         if not st_df.empty:
             def map_supplier(name):
                 s = normalize_text(name)
-                # התאמה מדויקת
                 if s in st.session_state.name_map:
                     return st.session_state.name_map[s]
-                # התאמה חלקית (contains) – עדיפות לביטויים ארוכים
                 for key in sorted(st.session_state.name_map.keys(), key=len, reverse=True):
                     if key and key in s:
                         return st.session_state.name_map[key]
@@ -272,7 +296,6 @@ def process_workbook(xlsx_bytes):
     col_debit    = headers.get("סכום חובה")
     col_credit   = headers.get("סכום זכות")
 
-    # צביעה כתומה לשורות בלי ספק
     orange = PatternFill(start_color="FFDDBB", end_color="FFDDBB", fill_type="solid")
     if col_supplier:
         for r in range(2, ws.max_row+1):
@@ -313,50 +336,79 @@ def process_workbook(xlsx_bytes):
     wb_out.save(final_bytes)
     return final_bytes.getvalue(), pd.DataFrame(summary_rows)
 
-# ---------------- UI – עדכון כללים ----------------
-with st.expander("⚙️ עדכון – כללי VLOOKUP קבועים ומורחבים", expanded=False):
-    st.write("אפשר לעדכן מס' ספק לפי **פרטים** (שם) או לפי **סכום**. העדכון נשמר בזמן הריצה ומשפיע מיד על העיבוד.")
+# ---------------- UI – עדכון כללים + שמירה ----------------
+with st.expander("⚙️ עדכון – כללי VLOOKUP קבועים ומורחבים (עם שמירה)", expanded=False):
+    st.write("אפשר לעדכן לפי **פרטים** (שם) או לפי **סכום**. העדכון נשמר לקובץ `rules_store.json`.")
+
     mode = st.radio("סוג עדכון", ["לפי פרטים (שם)", "לפי סכום"], horizontal=True)
 
     if mode == "לפי פרטים (שם)":
         name_input = st.text_input("פרטים (כמו שמופיע בדף הבנק)")
         supplier_input = st.text_input("מס' ספק (יכול להיות גם טקסט, למשל 67-1)")
-        cols = st.columns([1,1,1])
+        cols = st.columns([1,1,1,1])
         if cols[0].button("➕ הוסף/עדכן"):
             k = normalize_text(name_input)
             if k and supplier_input:
                 st.session_state.name_map[k] = supplier_input
-                st.success(f"הכלל עודכן: '{k}' → {supplier_input}")
+                save_rules_to_disk(st.session_state.name_map, st.session_state.amount_map)
+                st.success(f"הכלל נשמר: '{k}' → {supplier_input}")
         if cols[1].button("🗑️ מחיקה"):
             k = normalize_text(name_input)
             if k in st.session_state.name_map:
                 del st.session_state.name_map[k]
+                save_rules_to_disk(st.session_state.name_map, st.session_state.amount_map)
                 st.warning(f"הכלל נמחק: '{k}'")
+        if cols[2].button("💾 שמור ידנית"):
+            save_rules_to_disk(st.session_state.name_map, st.session_state.amount_map)
+            st.info("נשמר לקובץ rules_store.json")
         st.dataframe(pd.DataFrame({"by_name": list(st.session_state.name_map.keys()),
                                    "מס' ספק": list(st.session_state.name_map.values())}),
-                     use_container_width=True, height=240)
+                     use_container_width=True, height=260)
 
     else:  # לפי סכום
         amount_input = st.number_input("סכום (חיובי/שלילי – יישמר בערך מוחלט)", step=0.01, format="%.2f")
         supplier_input2 = st.text_input("מס' ספק", key="amount_supplier")
-        cols = st.columns([1,1,1])
+        cols = st.columns([1,1,1,1])
         if cols[0].button("➕ הוסף/עדכן", key="add_amount"):
             key_amt = round(abs(float(amount_input)), 2)
             if key_amt and supplier_input2:
                 st.session_state.amount_map[key_amt] = supplier_input2
-                st.success(f"הכלל עודכן: {key_amt} → {supplier_input2}")
+                save_rules_to_disk(st.session_state.name_map, st.session_state.amount_map)
+                st.success(f"הכלל נשמר: {key_amt} → {supplier_input2}")
         if cols[1].button("🗑️ מחיקה", key="del_amount"):
             key_amt = round(abs(float(amount_input)), 2)
             if key_amt in st.session_state.amount_map:
                 del st.session_state.amount_map[key_amt]
+                save_rules_to_disk(st.session_state.name_map, st.session_state.amount_map)
                 st.warning(f"הכלל נמחק: {key_amt}")
+        if cols[2].button("💾 שמור ידנית", key="save_amount"):
+            save_rules_to_disk(st.session_state.name_map, st.session_state.amount_map)
+            st.info("נשמר לקובץ rules_store.json")
         st.dataframe(pd.DataFrame({"סכום": list(st.session_state.amount_map.keys()),
                                    "מס' ספק": list(st.session_state.amount_map.values())})
-                     .sort_values("סכום"), use_container_width=True, height=240)
+                     .sort_values("סכום"), use_container_width=True, height=260)
 
-    st.download_button("⬇️ הורדת קובץ כללים מעודכן", data=rules_excel_bytes(),
-                       file_name="VLOOKUP_rules_updated.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.divider()
+    c1, c2, c3 = st.columns([1,1,2])
+    # ייצוא/ייבוא JSON לכללים
+    c1.download_button("⬇️ ייצוא JSON", data=json.dumps({
+                            "name_map": st.session_state.name_map,
+                            "amount_map": st.session_state.amount_map
+                        }, ensure_ascii=False, indent=2).encode("utf-8"),
+                        file_name="rules_store.json", mime="application/json")
+    uploaded_rules = c2.file_uploader("⬆️ ייבוא JSON", type=["json"], label_visibility="collapsed")
+    if c3.button("ייבוא והחלפה"):
+        if uploaded_rules is not None:
+            try:
+                data = json.loads(uploaded_rules.read().decode("utf-8"))
+                nm = { normalize_text(k): v for k, v in data.get("name_map", {}).items() }
+                am = { float(k): v for k, v in data.get("amount_map", {}).items() }
+                st.session_state.name_map = nm
+                st.session_state.amount_map = am
+                save_rules_to_disk(nm, am)
+                st.success("הכללים יובאו ונשמרו בהצלחה.")
+            except Exception as e:
+                st.error(f"שגיאה בייבוא: {e}")
 
 st.divider()
 
@@ -373,4 +425,4 @@ if st.button("הרצה") and uploaded is not None:
                        file_name="התאמות_והוראת_קבע.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
-    st.caption("טיפ: אפשר לעדכן כללים למעלה – השינויים נשמרים בזמן הריצה ומשפיעים מיידית על התוצאות.")
+    st.caption("טיפ: הכללים נשמרים אוטומטית ל־rules_store.json. אפשר גם לייצא/לייבא JSON לגיבוי.")
