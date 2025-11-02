@@ -18,32 +18,48 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("התאמות לקוחות – OV/RC + הוראות קבע")
-st.caption("כללי VLOOKUP קבועים בקוד. מעלה אקסל מקור ומוריד אקסל מעובד.")
+st.title("התאמות לקוחות – OV/RC + הוראות קבע (VLOOKUP קבוע)")
+st.caption("מעלים קובץ אקסל מקור ומקבלים קובץ מעובד עם מס' התאמה, גיליון 'הוראת קבע ספקים', צביעה ושורת סיכום 20001.")
 
-# -------- כללי VLOOKUP קבועים --------
-DEFAULT_NAME_MAP = {
+# -------- כללי VLOOKUP קבועים (מורחבים) --------
+RAW_NAME_MAP = {
+    "בזק בינלאומי ב": 30006,
+    "פרי ירוחם חב'": 34714,
+    "סלקום ישראל בע": 30055,
+    "בזק-הוראות קבע": 34746,
+    "דרך ארץ הייוי": 34602,
+    "גלובס פבלישר ע": 30067,
+    "פלאפון תקשורת": 30030,
+    "מרכז הכוכביות": 30002,
+    "ע.אשדוד-מסים": 30056,
+    "א.ש.א(בס\"ד)אחז": 30050,
+    "או.פי.ג'י(מ.כ)": 30047,
+    "רשות האכיפה וה": "67-1",
+    "קול ביז מילניו": 30053,
+    "פריוריטי סופטו": 30097,
+    "אינטרנט רימון": 34636,
+    "עו\"דכנית בע\"מ": 30018,
+    "עיריית רמת גן": 30065,
+    "פז חברת נפט בע": 34811,
+    "ישראכרט": 28002,
+    "חברת החשמל ליש": 30015,
+    "הפניקס ביטוח": 34686,
+    "מימון ישיר מקב": 34002,
+    "שלמה טפר": 30247,
+    "נמרוד תבור עורך-דין": 30038,
+    "עיריית בית שמש": 34805,
+    "פז קמעונאות וא": 34811,
+    "הו\"ק הלו' רבית": 8004,
+    "הו\"ק הלואה קרן": 23001,
+    # כללים כלליים שהיו
     "עיריית אשדוד": 30056,
     "ישראכרט מור": 34002,
 }
-DEFAULT_AMOUNT_MAP = {
-    8520.0: 30247,
-    10307.3: 30038,
-}
 
-def rules_excel_bytes():
-    """קובץ להורדה עם טבלאות הכללים הקבועות (אופציונלי)."""
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="xlsxwriter") as w:
-        pd.DataFrame(
-            {"by_name": list(DEFAULT_NAME_MAP.keys()),
-             "מס' ספק": list(DEFAULT_NAME_MAP.values())}
-        ).to_excel(w, index=False, sheet_name="by_name")
-        pd.DataFrame(
-            {"סכום": list(DEFAULT_AMOUNT_MAP.keys()),
-             "מס' ספק": list(DEFAULT_AMOUNT_MAP.values())}
-        ).to_excel(w, index=False, sheet_name="by_amount")
-    return out.getvalue()
+DEFAULT_AMOUNT_MAP = {
+    8520.0: 30247,    # שלמה טפר
+    10307.3: 30038,   # נמרוד תבור עו"ד
+}
 
 # -------- עזר --------
 MATCH_COL_CANDS = ["מס.התאמה","מס. התאמה","מס התאמה","מספר התאמה","התאמה"]
@@ -53,6 +69,17 @@ BOOKS_AMT_CANDS = ["סכום בספרים","סכום בספר","סכום ספר�
 REF_CANDS       = ["אסמכתא 1","אסמכתא1","אסמכתא","אסמכתה"]
 DATE_CANDS      = ["תאריך מאזן","תאריך ערך","תאריך"]
 DETAILS_CANDS   = ["פרטים","תיאור","שם ספק"]
+
+def normalize_text(s):
+    if s is None:
+        return ""
+    t = str(s)
+    t = t.replace("'", "").replace('"', "").replace("’", "").replace("`", "")
+    t = t.replace("-", " ").replace("–", " ").replace("־", " ")
+    return re.sub(r"\s+", " ", t).strip()
+
+# בונים מפה מנורמלת (להשוואה יציבה)
+DEFAULT_NAME_MAP = { normalize_text(k): v for k, v in RAW_NAME_MAP.items() }
 
 def ws_to_df(ws):
     rows = list(ws.iter_rows(values_only=True))
@@ -69,42 +96,29 @@ def ws_to_df(ws):
     data = [tuple(list(row)[:len(header)]) for row in rows[start:]]
     return pd.DataFrame(data, columns=header)
 
-def exact_or_contains(df, wanted):
-    for n in wanted:
+def exact_or_contains(df, names):
+    for n in names:
         if n in df.columns:
             return n
-    for n in wanted:
+    for n in names:
         for c in df.columns:
-            if isinstance(c, str) and n in c:
+            if isinstance(c,str) and n in c:
                 return c
     return None
 
 def normalize_date(series):
     def f(x):
-        if pd.isna(x):
-            return pd.NaT
-        if isinstance(x, (pd.Timestamp, datetime)):
-            return pd.Timestamp(x.date())
+        if pd.isna(x): return pd.NaT
+        if isinstance(x,(pd.Timestamp, datetime)): return pd.Timestamp(x.date())
         return pd.to_datetime(x, dayfirst=True, errors="coerce").normalize()
     return series.apply(f)
 
 def to_number(series):
-    return pd.to_numeric(
-        series.astype(str).str.replace(",", "").str.replace("₪", "").str.strip(),
-        errors="coerce"
-    )
+    return pd.to_numeric(series.astype(str).str.replace(",","").str.replace("₪","").str.strip(), errors="coerce")
 
 def ref_starts_with_ov_rc(val):
     t = (str(val) if val is not None else "").strip().upper()
     return t.startswith("OV") or t.startswith("RC")
-
-def normalize_text(s):
-    if s is None:
-        return ""
-    t = str(s)
-    t = t.replace("'", "").replace('"', "").replace("’", "").replace("`", "")
-    t = t.replace("-", " ").replace("–", " ").replace("־", " ")
-    return re.sub(r"\s+", " ", t).strip()
 
 # -------- לוגיקה --------
 def process_workbook(xlsx_bytes):
@@ -112,12 +126,12 @@ def process_workbook(xlsx_bytes):
 
     out_stream = io.BytesIO()
     summary_rows = []
-    standing_rows = []  # לאיסוף הוראות קבע 515/469
+    standing_rows = []
 
     with pd.ExcelWriter(out_stream, engine="xlsxwriter") as writer:
         for ws in wb_in.worksheets:
             df = ws_to_df(ws)
-            df_save = df.copy()  # נשמר כדי לכתוב חזרה בלי לפגוע בעמודות אחרות
+            df_save = df.copy()
 
             if df.empty:
                 pd.DataFrame().to_excel(writer, index=False, sheet_name=ws.title)
@@ -136,7 +150,6 @@ def process_workbook(xlsx_bytes):
             pairs = 0
             flagged = 0
 
-            # וקטורים
             match_values = df_save[col_match].copy() if col_match in df_save.columns else pd.Series([None]*len(df_save))
             _date      = normalize_date(pd.to_datetime(df[col_date], errors="coerce")) if col_date else pd.Series([pd.NaT]*len(df))
             _bank_amt  = to_number(df[col_bank_amt])  if col_bank_amt  else pd.Series([np.nan]*len(df))
@@ -145,7 +158,7 @@ def process_workbook(xlsx_bytes):
             _ref       = df[col_ref].astype(str).fillna("") if col_ref else pd.Series([""]*len(df))
             _details   = df[col_details].astype(str).fillna("") if col_details else pd.Series([""]*len(df))
 
-            # כלל 1: OV/RC → 1
+            # כלל 1: OV/RC -> 1
             if all([col_bank_code, col_bank_amt, col_books_amt, col_ref, col_date]):
                 applied_ovrc = True
                 books_candidates = [
@@ -177,7 +190,7 @@ def process_workbook(xlsx_bytes):
                             used_books.add(chosen)
                             pairs += 1
 
-            # כלל 2: הוראות קבע 515/469 → 2 + איסוף לגיליון ייעודי
+            # כלל 2: הוראות קבע 515/469 -> 2 + איסוף לגיליון
             if all([col_bank_code, col_details, col_bank_amt]):
                 applied_standing = True
                 for i in range(len(df)):
@@ -185,12 +198,8 @@ def process_workbook(xlsx_bytes):
                     if pd.notna(code) and int(code) in (515, 469):
                         match_values.iat[i] = 2
                         flagged += 1
-                        standing_rows.append({
-                            "פרטים": _details.iat[i],
-                            "סכום":  _bank_amt.iat[i],
-                        })
+                        standing_rows.append({"פרטים": _details.iat[i], "סכום": _bank_amt.iat[i]})
 
-            # כתיבה חזרה לגיליון המקורי (שינוי רק בעמודת מס.התאמה)
             df_out = df_save.copy()
             df_out[col_match] = match_values
             df_out.to_excel(writer, index=False, sheet_name=ws.title)
@@ -204,14 +213,15 @@ def process_workbook(xlsx_bytes):
                 "עמודת התאמה": col_match
             })
 
-        # גיליון "הוראת קבע ספקים"
+        # גיליון הוראת קבע ספקים
         st_df = pd.DataFrame(standing_rows)
         if not st_df.empty:
-            # מיפוי שם -> ספק (מדויק ואח"כ contains)
             def map_supplier(name):
                 s = normalize_text(name)
+                # התאמה מדויקת
                 if s in DEFAULT_NAME_MAP:
                     return DEFAULT_NAME_MAP[s]
+                # התאמה חלקית (contains), עדיפות למחרוזות ארוכות
                 for key in sorted(DEFAULT_NAME_MAP.keys(), key=len, reverse=True):
                     if key and key in s:
                         return DEFAULT_NAME_MAP[key]
@@ -219,7 +229,6 @@ def process_workbook(xlsx_bytes):
 
             st_df["מס' ספק"] = st_df["פרטים"].apply(map_supplier)
 
-            # נפילה לפי סכום אם אין שם
             def by_amount(row):
                 if not row["מס' ספק"]:
                     if pd.notna(row["סכום"]):
@@ -230,11 +239,9 @@ def process_workbook(xlsx_bytes):
 
             st_df["מס' ספק"] = st_df.apply(by_amount, axis=1)
 
-            # פיצול חובה/זכות
             st_df["סכום חובה"] = st_df["סכום"].apply(lambda x: x if pd.notna(x) and x > 0 else 0)
             st_df["סכום זכות"] = st_df["סכום"].apply(lambda x: abs(x) if pd.notna(x) and x < 0 else 0)
-
-            st_df = st_df[["פרטים", "סכום", "מס' ספק", "סכום חובה", "סכום זכות"]]
+            st_df = st_df[["פרטים","סכום","מס' ספק","סכום חובה","סכום זכות"]]
         else:
             st_df = pd.DataFrame(columns=["פרטים","סכום","מס' ספק","סכום חובה","סכום זכות"])
 
@@ -242,11 +249,9 @@ def process_workbook(xlsx_bytes):
 
     # ---------- עיצוב ושורת סיכום ----------
     wb_out = load_workbook(io.BytesIO(out_stream.getvalue()))
-    # RTL לכל הגיליונות
-    for ws in wb_out.worksheets:
-        ws.sheet_view.rightToLeft = True
+    for s in wb_out.worksheets:
+        s.sheet_view.rightToLeft = True
 
-    # צביעה + סיכום ב"הוראת קבע ספקים"
     ws = wb_out["הוראת קבע ספקים"]
     headers = {cell.value: idx for idx, cell in enumerate(ws[1], start=1)}
     col_supplier = headers.get("מס' ספק")
@@ -255,27 +260,27 @@ def process_workbook(xlsx_bytes):
     col_debit    = headers.get("סכום חובה")
     col_credit   = headers.get("סכום זכות")
 
-    # צביעה כתום לשורות בלי ספק
+    # צביעה כתומה לשורות בלי ספק
     orange = PatternFill(start_color="FFDDBB", end_color="FFDDBB", fill_type="solid")
     if col_supplier:
-        for r in range(2, ws.max_row + 1):
+        for r in range(2, ws.max_row+1):
             v = ws.cell(row=r, column=col_supplier).value
             if v in ("", None):
-                for c in range(1, ws.max_column + 1):
+                for c in range(1, ws.max_column+1):
                     ws.cell(row=r, column=c).fill = orange
 
     # מחיקת שורות 20001 ישנות
-    to_del = []
-    for r in range(2, ws.max_row + 1):
+    dels = []
+    for r in range(2, ws.max_row+1):
         v = ws.cell(row=r, column=col_supplier).value
-        if v == 20001 or (isinstance(v, str) and v.strip() == "20001"):
-            to_del.append(r)
-    for k, r in enumerate(to_del):
-        ws.delete_rows(r - k, 1)
+        if v == 20001 or (isinstance(v,str) and v.strip() == "20001"):
+            dels.append(r)
+    for k, r in enumerate(dels):
+        ws.delete_rows(r-k, 1)
 
-    # חישוב סה"כ חובה לשורות שיש להן ספק → נרשם בזכות בשורת 20001
+    # סה"כ חובה לשורות עם ספק -> נכתב בזכות בשורת 20001
     total_from_debit = 0.0
-    for r in range(2, ws.max_row + 1):
+    for r in range(2, ws.max_row+1):
         sv = ws.cell(row=r, column=col_supplier).value
         if sv not in (None, ""):
             try:
@@ -289,7 +294,7 @@ def process_workbook(xlsx_bytes):
     if col_supplier: ws.cell(row=last, column=col_supplier, value=20001)
     if col_debit:    ws.cell(row=last, column=col_debit,    value=0)
     if col_credit:   ws.cell(row=last, column=col_credit,   value=round(total_from_debit, 2))
-    for c in range(1, ws.max_column + 1):
+    for c in range(1, ws.max_column+1):
         ws.cell(row=last, column=c).font = Font(bold=True)
 
     final_bytes = io.BytesIO()
@@ -298,9 +303,6 @@ def process_workbook(xlsx_bytes):
 
 # ---------------- UI actions ----------------
 uploaded = st.file_uploader("בחרי קובץ אקסל מקור (xlsx)", type=["xlsx"])
-st.download_button("⬇️ הורדת קובץ כללים קבוע", data=rules_excel_bytes(),
-                   file_name="VLOOKUP_rules_fixed.xlsx",
-                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 if st.button("הרצה") and uploaded is not None:
     with st.spinner("מעבד..."):
@@ -312,4 +314,4 @@ if st.button("הרצה") and uploaded is not None:
                        file_name="התאמות_והוראת_קבע.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
-    st.info("ה-VLOOKUP קבוע בקוד. רק מעלים קובץ מקור ומריצים.")
+    st.info("VLOOKUP קבוע בקוד. העלי קובץ מקור ולחצי הרצה.")
