@@ -1,4 +1,3 @@
-# streamlit_app.py
 # -*- coding: utf-8 -*-
 import io, re, os, json
 from datetime import datetime
@@ -18,7 +17,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("התאמות לקוחות – OV/RC + הוראות קבע (VLOOKUP קבוע + שמירה) + העברות ספקים (3)")
+st.title("התאמות לקוחות – OV/RC + הוראות קבע (VLOOKUP קבוע + שמירה) + התאמת ספקים – העברות (3)")
 
 # -------- כללי VLOOKUP בסיסיים (default) --------
 RAW_NAME_MAP = {
@@ -66,7 +65,13 @@ BANK_AMT_CANDS  = ["סכום בדף","סכום דף","סכום בבנק","סכו
 BOOKS_AMT_CANDS = ["סכום בספרים","סכום בספר","סכום ספרים"]
 REF_CANDS       = ["אסמכתא 1","אסמכתא1","אסמכתא","אסמכתה"]
 DATE_CANDS      = ["תאריך מאזן","תאריך ערך","תאריך"]
-DETAILS_CANDS   = ["פרטים","תיאור","שם ספק"]
+DETAILS_CANDS   = ["פרטים","תיאור","שם ספק","שם הפעולה"]
+
+# ---- שדות בקובץ העזר (התאמה 3) ----
+AUX_DATE_CANDS   = ["תאריך פריקה","תאריך"]
+AUX_TIME_CANDS   = ["זמן","שעה","זמן פריקה"]
+AUX_AMOUNT_CANDS = ["אחרי ניכוי","אחרי ניכוי מס","סכום אחרי ניכוי"]
+AUX_PAYNUM_CANDS = ["מס' תשלום","מספר תשלום","אסמכתא תשלום"]
 
 RULES_FILE = "rules_store.json"
 
@@ -84,22 +89,17 @@ def load_rules_from_disk():
         try:
             with open(RULES_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            # ניקוי/נרמול
             name_map = { normalize_text(k): v for k, v in data.get("name_map", {}).items() }
             amount_map = { float(k): v for k, v in data.get("amount_map", {}).items() }
             return name_map, amount_map
         except Exception:
             pass
-    # אם אין קובץ – נחזיר בסיס
     return { normalize_text(k): v for k, v in RAW_NAME_MAP.items() }, dict(BASE_AMOUNT_MAP)
 
 def save_rules_to_disk(name_map, amount_map):
     try:
         with open(RULES_FILE, "w", encoding="utf-8") as f:
-            json.dump({
-                "name_map": name_map,
-                "amount_map": amount_map
-            }, f, ensure_ascii=False, indent=2)
+            json.dump({"name_map": name_map, "amount_map": amount_map}, f, ensure_ascii=False, indent=2)
         return True
     except Exception:
         return False
@@ -160,48 +160,45 @@ def ref_starts_with_ov_rc(val):
     t = (str(val) if val is not None else "").strip().upper()
     return t.startswith("OV") or t.startswith("RC")
 
+# ---------- בניית מיפוי סכום -> סט מס' תשלום (מהקובץ העזר) ----------
+def build_amount_to_paynums(aux_df: pd.DataFrame):
+    aux_date   = exact_or_contains(aux_df, AUX_DATE_CANDS)
+    aux_time   = exact_or_contains(aux_df, AUX_TIME_CANDS)
+    aux_amount = exact_or_contains(aux_df, AUX_AMOUNT_CANDS)
+    aux_paynum = exact_or_contains(aux_df, AUX_PAYNUM_CANDS)
+    if not all([aux_date, aux_amount, aux_paynum]):
+        raise ValueError("בקובץ העזר חייבות להיות עמודות: תאריך פריקה, אחרי ניכוי, מס' תשלום (ושדה זמן אם קיים).")
+
+    aux_amt = to_number(aux_df[aux_amount]).fillna(0)
+    aux_dt  = normalize_date(aux_df[aux_date])
+
+    grp_key = aux_dt.astype(str)
+    if aux_time and aux_time in aux_df.columns:
+        try:
+            tser = pd.to_datetime(aux_df[aux_time], errors="coerce").dt.strftime("%H:%M:%S")
+        except Exception:
+            tser = aux_df[aux_time].astype(str)
+        grp_key = grp_key + " " + tser.fillna("")
+
+    work = pd.DataFrame({"g": grp_key, "amt": aux_amt, "pay": aux_df[aux_paynum].astype(str).str.strip()})
+    sums = work.groupby("g")["amt"].sum().abs().round(2)
+    amount_to_paynums = {}
+    for g, total in sums.items():
+        amt = float(total)
+        pays = set(work.loc[work["g"]==g, "pay"].dropna().astype(str))
+        amount_to_paynums.setdefault(amt, set()).update(pays)
+    return amount_to_paynums
+
 # -------- לוגיקה --------
-def process_workbook(xlsx_bytes, aux_bytes=None, enable_match3=True):
+def process_workbook(xlsx_bytes: bytes, aux_bytes: bytes | None = None):
     wb_in = load_workbook(io.BytesIO(xlsx_bytes), data_only=True, read_only=True)
 
-    # --- קריאת קובץ עזר להתאמה 3 (לא חובה) ---
+    # מיפוי סכומים -> מס' תשלום (אם הועלה קובץ עזר)
     amount_to_paynums = {}
-    if enable_match3 and aux_bytes is not None:
+    if aux_bytes is not None:
         wb_aux = load_workbook(io.BytesIO(aux_bytes), data_only=True, read_only=True)
-        ws_aux = wb_aux.worksheets[0]
-        aux_df = ws_to_df(ws_aux)
-
-        AUX_DATE_CANDS   = ["תאריך פריקה","תאריך"]
-        AUX_TIME_CANDS   = ["זמן","שעה","זמן פריקה"]
-        AUX_AMOUNT_CANDS = ["אחרי ניכוי","אחרי ניכוי מס","סכום אחרי ניכוי"]
-        AUX_PAYNUM_CANDS = ["מס' תשלום","מספר תשלום","אסמכתא תשלום"]
-
-        aux_date   = exact_or_contains(aux_df, AUX_DATE_CANDS)
-        aux_time   = exact_or_contains(aux_df, AUX_TIME_CANDS)
-        aux_amount = exact_or_contains(aux_df, AUX_AMOUNT_CANDS)
-        aux_paynum = exact_or_contains(aux_df, AUX_PAYNUM_CANDS)
-
-        if all([aux_date, aux_amount, aux_paynum]):
-            aux_amt = to_number(aux_df[aux_amount])
-            aux_dt  = normalize_date(aux_df[aux_date])
-
-            # יצירת מפתח קבוצה: תאריך + (זמן אם קיים)
-            grp_key = aux_dt.astype(str)
-            if aux_time and aux_time in aux_df.columns:
-                # ננסה לפרש שעה; אם לא מצליח – נשאיר טקסט
-                try:
-                    tser = pd.to_datetime(aux_df[aux_time], errors="coerce").dt.strftime("%H:%M:%S")
-                except Exception:
-                    tser = aux_df[aux_time].astype(str)
-                grp_key = grp_key + " " + tser.fillna("")
-
-            aux_work = pd.DataFrame({"g": grp_key, "amt": aux_amt, "pay": aux_df[aux_paynum].astype(str).str.strip()})
-            # סכום לקבוצה (אבסולוטי, 2 ספרות)
-            sums = aux_work.groupby("g")["amt"].sum().abs().round(2)
-            for gkey, total in sums.items():
-                amt = float(total)
-                pays = set(aux_work.loc[aux_work["g"]==gkey, "pay"].dropna().astype(str))
-                amount_to_paynums.setdefault(amt, set()).update(pays)
+        aux_df = ws_to_df(wb_aux.worksheets[0])
+        amount_to_paynums = build_amount_to_paynums(aux_df)
 
     out_stream = io.BytesIO()
     summary_rows, standing_rows = [], []
@@ -237,7 +234,7 @@ def process_workbook(xlsx_bytes, aux_bytes=None, enable_match3=True):
             _ref       = df[col_ref].astype(str).fillna("") if col_ref else pd.Series([""]*len(df))
             _details   = df[col_details].astype(str).fillna("") if col_details else pd.Series([""]*len(df))
 
-            # ---------- התאמה 1: OV/RC -> 1 ----------
+            # -------- OV/RC -> 1 --------
             if all([col_bank_code, col_bank_amt, col_books_amt, col_ref, col_date]):
                 applied_ovrc = True
                 books_candidates = [
@@ -264,52 +261,51 @@ def process_workbook(xlsx_bytes, aux_bytes=None, enable_match3=True):
                         elif len(cands) > 1:
                             chosen = min(cands, key=lambda j: abs(j - i))
                         if chosen is not None:
-                            if match_values.iat[i] not in (1,2,3):
-                                match_values.iat[i] = 1
-                            if match_values.iat[chosen] not in (1,2,3):
-                                match_values.iat[chosen] = 1
+                            match_values.iat[i] = 1
+                            match_values.iat[chosen] = 1
                             used_books.add(chosen)
                             pairs += 1
 
-            # ---------- התאמה 2: הוראות קבע -> 2 ----------
+            # -------- Standing orders 515/469 -> 2 --------
             if all([col_bank_code, col_details, col_bank_amt]):
                 applied_standing = True
                 for i in range(len(df)):
                     code = _bank_code.iat[i]
                     if pd.notna(code) and int(code) in (515, 469):
-                        if match_values.iat[i] not in (1,3):
-                            match_values.iat[i] = 2
+                        match_values.iat[i] = 2
                         flagged += 1
                         standing_rows.append({"פרטים": _details.iat[i], "סכום": _bank_amt.iat[i]})
 
-            # ---------- התאמה 3: העברות ספקים -> 3 ----------
-            if enable_match3 and amount_to_paynums and all([col_bank_code, col_details, col_bank_amt, col_ref]):
+            # -------- Transfers (Supplier batches) -> 3 --------
+            # דרוש קובץ עזר: amount_to_paynums
+            if amount_to_paynums and all([col_bank_code, col_details, col_bank_amt]):
                 phrase = "העב' במקבץ-נט"
-                applied_transfers = True
-                # מועמדים: קוד 485 + פרטים מכיל "העב' במקבץ-נט" + סכום בדף > 0
-                bank_mask = (
+                # שורות בנק מועמדות: 485 + פרטים מכילים את הביטוי + סכום בנק חיובי
+                bank_idx = df.index[
                     (_bank_code == 485) &
-                    (_details.str.contains(phrase, na=False)) &
-                    (_bank_amt > 0)
-                )
-                candidates_idx = list(np.where(bank_mask)[0])
-                for i in candidates_idx:
-                    amt = round(abs(float(_bank_amt.iat[i])), 2)
-                    paynums = amount_to_paynums.get(float(amt), set())
+                    (_bank_amt > 0) &
+                    (_details.str.contains(phrase, na=False))
+                ]
+                for i in bank_idx:
+                    amt = round(float(_bank_amt.iat[i]), 2)
+                    paynums = amount_to_paynums.get(amt, set())
                     if not paynums:
                         continue
-                    # סימון לשורת הבנק עצמה
-                    if match_values.iat[i] not in (1,2):
+                    # מסמן את שורת הבנק (לא לדרוס 1/2)
+                    if match_values.iat[i] not in (1, 2):
                         match_values.iat[i] = 3
                         flagged3 += 1
-                    # סימון לכל שורה שה"אסמכתא 1" שלה ברשימת מס' התשלום
-                    mask_pay = _ref.astype(str).isin(paynums)
-                    for j in np.where(mask_pay)[0].tolist():
-                        if match_values.iat[j] not in (1,2):
-                            match_values.iat[j] = 3
-                            flagged3 += 1
+                    # מסמן את כל השורות שהאסמכתא שלהן נמצאת ב-paynums (לא לדרוס 1/2)
+                    if col_ref:
+                        mask = _ref.isin(paynums)
+                        for j in df.index[mask]:
+                            if match_values.iat[j] not in (1, 2):
+                                match_values.iat[j] = 3
+                                flagged3 += 1
+                if flagged3:
+                    applied_transfers = True
 
-            # כתיבה חזרה
+            # כתיבה חזרה לגיליון
             df_out = df_save.copy()
             df_out[col_match] = match_values
             df_out.to_excel(writer, index=False, sheet_name=ws.title)
@@ -320,12 +316,12 @@ def process_workbook(xlsx_bytes, aux_bytes=None, enable_match3=True):
                 "זוגות שסומנו 1": pairs,
                 "הוראת קבע בוצע": "כן" if applied_standing else "לא",
                 "שורות שסומנו 2": flagged,
-                "העברות (3) בוצע": "כן" if applied_transfers else "לא",
+                "התאמות העברות (3)": "כן" if applied_transfers else "לא",
                 "שורות שסומנו 3": flagged3,
                 "עמודת התאמה": col_match
             })
 
-        # גיליון הוראת קבע ספקים
+        # ===== גיליון "הוראת קבע ספקים" (ללא שינוי) =====
         st_df = pd.DataFrame(standing_rows)
         if not st_df.empty:
             def map_supplier(name):
@@ -357,7 +353,7 @@ def process_workbook(xlsx_bytes, aux_bytes=None, enable_match3=True):
 
         st_df.to_excel(writer, index=False, sheet_name="הוראת קבע ספקים")
 
-    # ---------- עיצוב ושורת סיכום להוראת קבע ----------
+    # ---------- עיצוב ושורת סיכום ----------
     wb_out = load_workbook(io.BytesIO(out_stream.getvalue()))
     for s in wb_out.worksheets:
         s.sheet_view.rightToLeft = True
@@ -382,21 +378,20 @@ def process_workbook(xlsx_bytes, aux_bytes=None, enable_match3=True):
     dels = []
     for r in range(2, ws.max_row+1):
         v = ws.cell(row=r, column=col_supplier).value
-        if v == 20001 or (isinstance(v,str) and str(v).strip() == "20001"):
+        if v == 20001 or (isinstance(v,str) and v.strip() == "20001"):
             dels.append(r)
     for k, r in enumerate(dels):
         ws.delete_rows(r-k, 1)
 
     # סה"כ חובה לשורות עם ספק -> נכתב בזכות בשורת 20001
     total_from_debit = 0.0
-    if col_debit and col_supplier:
-        for r in range(2, ws.max_row+1):
-            sv = ws.cell(row=r, column=col_supplier).value
-            if sv not in (None, ""):
-                try:
-                    total_from_debit += float(ws.cell(row=r, column=col_debit).value or 0)
-                except Exception:
-                    pass
+    for r in range(2, ws.max_row+1):
+        sv = ws.cell(row=r, column=col_supplier).value
+        if sv not in (None, ""):
+            try:
+                total_from_debit += float(ws.cell(row=r, column=col_debit).value or 0)
+            except Exception:
+                pass
 
     last = ws.max_row + 1
     if col_details:  ws.cell(row=last, column=col_details,  value="סה\"כ זכות – עם מס' ספק")
@@ -465,7 +460,6 @@ with st.expander("⚙️ עדכון – כללי VLOOKUP קבועים ומורח
 
     st.divider()
     c1, c2, c3 = st.columns([1,1,2])
-    # ייצוא/ייבוא JSON לכללים
     c1.download_button("⬇️ ייצוא JSON", data=json.dumps({
                             "name_map": st.session_state.name_map,
                             "amount_map": st.session_state.amount_map
@@ -487,21 +481,22 @@ with st.expander("⚙️ עדכון – כללי VLOOKUP קבועים ומורח
 
 st.divider()
 
-# ---------------- קלט קבצים + התאמה 3 ----------------
-col_up1, col_up2 = st.columns(2)
-uploaded = col_up1.file_uploader("בחרי קובץ אקסל מקור (xlsx)", type=["xlsx"])
-uploaded_aux = col_up2.file_uploader("קובץ עזר להתאמה 3 (xlsx) – תאריך פריקה / אחרי ניכוי / מס' תשלום", type=["xlsx"])
-enable_match3 = st.toggle("להפעיל התאמה 3 – העברות ספקים", value=True)
+# ---------------- עיבוד הקובץ ----------------
+uploaded = st.file_uploader("בחרי קובץ אקסל מקור (xlsx)", type=["xlsx"])
+aux_uploaded = st.file_uploader("קובץ עזר להעברות (xlsx) — לא חובה. אם יועלה, תתבצע גם התאמה 3.", type=["xlsx"])
 
-if st.button("הרצה") and uploaded is not None:
-    with st.spinner("מעבד..."):
-        aux_bytes = uploaded_aux.read() if (uploaded_aux is not None and enable_match3) else None
-        out_bytes, summary = process_workbook(uploaded.read(), aux_bytes=aux_bytes, enable_match3=enable_match3)
-    st.success("מוכן! אפשר להוריד את הקובץ המעודכן.")
-    st.dataframe(summary, use_container_width=True)
-    st.download_button("⬇️ הורדת קובץ מעודכן",
-                       data=out_bytes,
-                       file_name="התאמות_והוראת_קבע_+_העברות.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+if st.button("הרצה"):
+    if uploaded is None:
+        st.error("יש להעלות קובץ מקור.")
+    else:
+        with st.spinner("מעבד..."):
+            aux_bytes = aux_uploaded.read() if aux_uploaded is not None else None
+            out_bytes, summary = process_workbook(uploaded.read(), aux_bytes=aux_bytes)
+        st.success("מוכן! אפשר להוריד את הקובץ המעודכן.")
+        st.dataframe(summary, use_container_width=True)
+        st.download_button("⬇️ הורדת קובץ מעודכן",
+                           data=out_bytes,
+                           file_name="התאמות_+_הוראת_קבע_+_התאמה3.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
     st.caption("טיפ: הכללים נשמרים אוטומטית ל־rules_store.json. אפשר גם לייצא/לייבא JSON לגיבוי.")
