@@ -536,3 +536,108 @@ if st.button("הרצה"):
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
     st.caption("טיפ: הכללים נשמרים אוטומטית ל־rules_store.json. אפשר גם לייצא/לייבא JSON לגיבוי.")
+# ==== עזר מינימלי ====
+import re
+import numpy as np
+import pandas as pd
+
+AMOUNT_TOL_4 = 0.20   # טולרנס לסכומים בכלל 4
+CHECK_CODE   = 493    # קוד פעולה בנק לשיקי ספקים
+
+def _only_digits(s: str) -> str:
+    """מחזיר ספרות בלבד ללא אפסים מובילים (לזיהוי אסמכתאות)."""
+    s = "" if s is None else str(s)
+    d = re.sub(r"\D", "", s).lstrip("0")
+    return d or "0"
+
+def _to_number(x):
+    """המרת ערכים מספריים באופן סלחני (עם פסיקים/מטבע)."""
+    if pd.isna(x): return np.nan
+    s = str(x).replace(",", "").replace("₪", "").strip()
+    try:
+        return float(s)
+    except Exception:
+        m = re.findall(r"[-+]?\d+(?:\.\d+)?", s)
+        return float(m[0]) if m else np.nan
+
+
+# ==== כלל 4 – שיקי ספקים ====
+def rule_4(df: pd.DataFrame, cols: dict, match: pd.Series) -> tuple[pd.Series, dict]:
+    """
+    התאמה 4 – שיקי ספקים:
+      בנק:   קוד פעולה == 493, 'שיק' בפרטים, סכום בדף > 0
+      ספרים: אסמכתא 1 מתחיל 'CH', 'תשלום בהמחאה' בפרטים, סכום בספרים < 0
+      התאמה: אסמכתא2(ספרים) == אסמכתא1(בנק) לאחר השוואת ספרות בלבד
+      טולרנס: |סכום בנק + סכום ספרים| <= AMOUNT_TOL_4
+      תאריכים: לא נבדקים
+    החזרה: (Series 'match' לאחר עדכון, dict סטטיסטיקה)
+    """
+    stats = {"pairs": 0}
+
+    # שמות עמודות צפויות מתוך cols
+    code = cols.get("bank_code")
+    bamt = cols.get("bank_amt")
+    samt = cols.get("books_amt")
+    ref1 = cols.get("ref")       # אסמכתא 1
+    ref2 = cols.get("ref2")      # אסמכתא 2
+    det  = cols.get("details")
+
+    # אם חסר משהו קריטי – לא עושים כלום
+    needed = [code, bamt, samt, ref1, ref2, det]
+    if any((c is None) or (c not in df.columns) for c in needed):
+        return match, stats
+
+    # עמודות מנורמלות
+    v_match = pd.to_numeric(match, errors="coerce").fillna(0)
+    v_code  = df[code].apply(_to_number)
+    v_bamt  = df[bamt].apply(_to_number)
+    v_samt  = df[samt].apply(_to_number)
+    v_det   = df[det].astype(str).fillna("")
+    v_r1    = df[ref1].astype(str).fillna("")
+    v_r2    = df[ref2].astype(str).fillna("")
+
+    r1_norm = v_r1.apply(_only_digits)
+    r2_norm = v_r2.apply(_only_digits)
+
+    # אינדקסים מועמדים
+    bank_idx = [
+        i for i in df.index
+        if float(v_match.iat[i]) == 0
+           and pd.notna(v_code.iat[i]) and int(v_code.iat[i]) == CHECK_CODE
+           and "שיק" in v_det.iat[i]
+           and pd.notna(v_bamt.iat[i]) and v_bamt.iat[i] > 0
+    ]
+
+    books_idx = [
+        j for j in df.index
+        if float(v_match.iat[j]) == 0
+           and str(v_r1.iat[j]).startswith("CH")
+           and "תשלום בהמחאה" in v_det.iat[j]
+           and pd.notna(v_samt.iat[j]) and v_samt.iat[j] < 0
+    ]
+
+    # קיבוץ ספרים לפי מזהה (אסמכתא2 מנורמלת)
+    books_by_id = {}
+    for j in books_idx:
+        key = r2_norm.iat[j]
+        books_by_id.setdefault(key, []).append(j)
+
+    used_books = set()
+    for i in bank_idx:
+        key = r1_norm.iat[i]
+        candidates = [j for j in books_by_id.get(key, []) if j not in used_books]
+
+        chosen = None
+        for j in candidates:
+            # בדיקת טולרנס סכומים: |בנκ + ספרים| <= טולרנס
+            if abs(float(v_bamt.iat[i]) + float(v_samt.iat[j])) <= AMOUNT_TOL_4:
+                chosen = j
+                break
+
+        if chosen is not None:
+            v_match.iat[i] = 4
+            v_match.iat[chosen] = 4
+            used_books.add(chosen)
+            stats["pairs"] += 1
+
+    return v_match, stats
