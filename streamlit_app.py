@@ -559,78 +559,118 @@ def _to_number(x):
     except Exception:
         m = re.findall(r"[-+]?\d+(?:\.\d+)?", s)
         return float(m[0]) if m else np.nan
+# ---------------- עזר מינימלי ----------------
+import re
+import numpy as np
+import pandas as pd
+
+# טקסטים/קודים מקובלים
+CHECK_CODE = 493
+DETAILS_BANK_KEYWORDS   = (r"\bשיק\b", r"\bשיק\b.*בנק", r"\bשיק\b.*מס'", r"\bשיק\b.*מספר")  # צד בנק
+DETAILS_BOOKS_KEYWORDS  = (r"תשלום\s*בהמחאה", r"\bהמחאה\b")                                 # צד ספרים
+AMOUNT_TOL_4 = 0.20  # טולרנס לסכום
+
+def _safe_str(x) -> str:
+    return "" if x is None else str(x)
+
+def _only_digits(x: str) -> str:
+    """ספרות בלבד ללא אפסים מובילים (לזיהוי שיק). ריק → '0' כדי שיהיה מפתח."""
+    s = re.sub(r"\D", "", _safe_str(x)).lstrip("0")
+    return s or "0"
+
+def _to_number(x):
+    if x is None or (isinstance(x, float) and np.isnan(x)): 
+        return np.nan
+    s = _safe_str(x).replace(",", "").replace("₪", "").strip()
+    m = re.findall(r"[-+]?\d+(?:\.\d+)?", s)
+    try:
+        return float(m[0]) if m else np.nan
+    except Exception:
+        return np.nan
+
+def _contains_any(text: str, patterns) -> bool:
+    t = _safe_str(text)
+    for p in patterns:
+        if re.search(p, t):
+            return True
+    return False
 
 
-# ==== כלל 4 – שיקי ספקים ====
-def rule_4(df: pd.DataFrame, cols: dict, match: pd.Series) -> tuple[pd.Series, dict]:
+# ---------------- התאמה 4 – שיקי ספקים ----------------
+def apply_rule_4(
+    df: pd.DataFrame,
+    cols: dict,
+    match: pd.Series,
+    tol: float = AMOUNT_TOL_4,
+    debug: bool = False,
+):
     """
-    התאמה 4 – שיקי ספקים:
-      בנק:   קוד פעולה == 493, 'שיק' בפרטים, סכום בדף > 0
-      ספרים: אסמכתא 1 מתחיל 'CH', 'תשלום בהמחאה' בפרטים, סכום בספרים < 0
-      התאמה: אסמכתא2(ספרים) == אסמכתא1(בנק) לאחר השוואת ספרות בלבד
-      טולרנס: |סכום בנק + סכום ספרים| <= AMOUNT_TOL_4
-      תאריכים: לא נבדקים
-    החזרה: (Series 'match' לאחר עדכון, dict סטטיסטיקה)
+    כלל 4:
+      בנק:   קוד פעולה == 493 AND 'שיק' בפרטים AND סכום בדף > 0
+      ספרים: אסמכתא 1 מתחילה 'CH' AND ('תשלום בהמחאה' או 'המחאה' בפרטים) AND סכום בספרים < 0
+      התאמה לפי מזהה שיק:  ספרות(אסמכתא2 בספרים) == ספרות(אסמכתא1 בבנק).
+      אם אסמכתא2 בספרים ריקה – ננסה ספרות מ-אסמכתא1 (CH12345 → 12345) כגיבוי.
+      לא נבדקים תאריכים. A2 – לא דורס סימון קיים.
+    החזרה: (Series match מעודכן, dict סטטיסטיקה[, DataFrame debug אופציונלי])
     """
-    stats = {"pairs": 0}
+    stats = {"pairs": 0, "bank_candidates": 0, "books_candidates": 0, "no_amount_match": 0}
 
-    # שמות עמודות צפויות מתוך cols
-    code = cols.get("bank_code")
-    bamt = cols.get("bank_amt")
-    samt = cols.get("books_amt")
-    ref1 = cols.get("ref")       # אסמכתא 1
-    ref2 = cols.get("ref2")      # אסמכתא 2
-    det  = cols.get("details")
+    # בדיקת עמודות
+    need = ("bank_code","bank_amt","books_amt","ref","ref2","details")
+    for k in need:
+        if cols.get(k) not in df.columns:
+            return (match, stats, pd.DataFrame()) if debug else (match, stats)
 
-    # אם חסר משהו קריטי – לא עושים כלום
-    needed = [code, bamt, samt, ref1, ref2, det]
-    if any((c is None) or (c not in df.columns) for c in needed):
-        return match, stats
-
-    # עמודות מנורמלות
+    # וקטורים מנורמלים
     v_match = pd.to_numeric(match, errors="coerce").fillna(0)
-    v_code  = df[code].apply(_to_number)
-    v_bamt  = df[bamt].apply(_to_number)
-    v_samt  = df[samt].apply(_to_number)
-    v_det   = df[det].astype(str).fillna("")
-    v_r1    = df[ref1].astype(str).fillna("")
-    v_r2    = df[ref2].astype(str).fillna("")
+    v_code  = df[cols["bank_code"]].apply(_to_number)
+    v_bamt  = df[cols["bank_amt"]].apply(_to_number)     # צד בנק (צפוי חיובי)
+    v_samt  = df[cols["books_amt"]].apply(_to_number)    # צד ספרים (צפוי שלילי)
+    v_det   = df[cols["details"]].astype(str).fillna("")
+    v_r1    = df[cols["ref"]].astype(str).fillna("")
+    v_r2    = df[cols["ref2"]].astype(str).fillna("")
 
-    r1_norm = v_r1.apply(_only_digits)
-    r2_norm = v_r2.apply(_only_digits)
+    # נרמול מזהי שיק
+    r1_digits = v_r1.apply(_only_digits)  # בנק
+    # ספרים: קודם אסמכתא2; אם ריק, ניקח ספרות מאסמכתא1 (CH12345→12345)
+    r2_digits = v_r2.apply(_only_digits)
+    r2_fallback = v_r1.apply(lambda s: _only_digits(_safe_str(s).replace("CH","").replace("ch","")))
+    r2_final = r2_digits.where(r2_digits.ne("0"), r2_fallback)
 
-    # אינדקסים מועמדים
+    # מועמדים
     bank_idx = [
         i for i in df.index
         if float(v_match.iat[i]) == 0
            and pd.notna(v_code.iat[i]) and int(v_code.iat[i]) == CHECK_CODE
-           and "שיק" in v_det.iat[i]
+           and _contains_any(v_det.iat[i], DETAILS_BANK_KEYWORDS)
            and pd.notna(v_bamt.iat[i]) and v_bamt.iat[i] > 0
     ]
-
     books_idx = [
         j for j in df.index
         if float(v_match.iat[j]) == 0
-           and str(v_r1.iat[j]).startswith("CH")
-           and "תשלום בהמחאה" in v_det.iat[j]
+           and _safe_str(v_r1.iat[j]).upper().startswith("CH")
+           and _contains_any(v_det.iat[j], DETAILS_BOOKS_KEYWORDS)
            and pd.notna(v_samt.iat[j]) and v_samt.iat[j] < 0
     ]
+    stats["bank_candidates"]  = len(bank_idx)
+    stats["books_candidates"] = len(books_idx)
 
-    # קיבוץ ספרים לפי מזהה (אסמכתא2 מנורמלת)
+    # קיבוץ ספרים לפי מזהה שיק
     books_by_id = {}
     for j in books_idx:
-        key = r2_norm.iat[j]
-        books_by_id.setdefault(key, []).append(j)
+        books_by_id.setdefault(r2_final.iat[j], []).append(j)
 
     used_books = set()
+    debug_rows = []
+
     for i in bank_idx:
-        key = r1_norm.iat[i]
+        key = r1_digits.iat[i]
         candidates = [j for j in books_by_id.get(key, []) if j not in used_books]
 
         chosen = None
         for j in candidates:
-            # בדיקת טולרנס סכומים: |בנκ + ספרים| <= טולרנס
-            if abs(float(v_bamt.iat[i]) + float(v_samt.iat[j])) <= AMOUNT_TOL_4:
+            ok_amount = abs(float(v_bamt.iat[i]) + float(v_samt.iat[j])) <= tol
+            if ok_amount:
                 chosen = j
                 break
 
@@ -639,5 +679,20 @@ def rule_4(df: pd.DataFrame, cols: dict, match: pd.Series) -> tuple[pd.Series, d
             v_match.iat[chosen] = 4
             used_books.add(chosen)
             stats["pairs"] += 1
+        else:
+            stats["no_amount_match"] += 1
+
+        if debug:
+            debug_rows.append({
+                "bank_row": i,
+                "bank_ref1_digits": key,
+                "bank_amount": v_bamt.iat[i],
+                "books_candidates": candidates,
+            })
+
+    if debug:
+        dbg = pd.DataFrame(debug_rows)
+        return v_match, stats, dbg
 
     return v_match, stats
+
