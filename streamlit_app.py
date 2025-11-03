@@ -594,105 +594,78 @@ def _contains_any(text: str, patterns) -> bool:
         if re.search(p, t):
             return True
     return False
+# טולרנס להתאמת סכומים בכלל 4
+AMOUNT_TOL_4 = 0.20
 
-
-# ---------------- התאמה 4 – שיקי ספקים ----------------
-def apply_rule_4(
-    df: pd.DataFrame,
-    cols: dict,
-    match: pd.Series,
-    tol: float = AMOUNT_TOL_4,
-    debug: bool = False,
-):
+# אסמכתא 2 – וריאציות שם עמודה
+REF2_CANDS = ["אסמכתא 2","אסמכתא2","אסמכתא נוספת","Reference 2"]
+def _apply_rule_4(df, cols, match_values):
     """
-    כלל 4:
-      בנק:   קוד פעולה == 493 AND 'שיק' בפרטים AND סכום בדף > 0
-      ספרים: אסמכתא 1 מתחילה 'CH' AND ('תשלום בהמחאה' או 'המחאה' בפרטים) AND סכום בספרים < 0
-      התאמה לפי מזהה שיק:  ספרות(אסמכתא2 בספרים) == ספרות(אסמכתא1 בבנק).
-      אם אסמכתא2 בספרים ריקה – ננסה ספרות מ-אסמכתא1 (CH12345 → 12345) כגיבוי.
-      לא נבדקים תאריכים. A2 – לא דורס סימון קיים.
-    החזרה: (Series match מעודכן, dict סטטיסטיקה[, DataFrame debug אופציונלי])
+    התאמה 4 – שיקים ספקים:
+    בנק: קוד פעולה 493, 'שיק', סכום בדף > 0
+    ספרים: 'תשלום בהמחאה', אסמכתא 1 מתחילה CH, סכום בספרים < 0
+    התאמה לפי: אסמכתא 2 (בספרים) == אסמכתא 1 (בנק) — בהשוואה מנורמלת ספרות בלבד (ללא מובילי אפסים)
+    סכום הפוך בתוך טולרנס AMOUNT_TOL_4. A2 – מסמנים רק אם "מס. התאמה" ריק/0.
     """
-    stats = {"pairs": 0, "bank_candidates": 0, "books_candidates": 0, "no_amount_match": 0}
+    stats = {"pairs": 0}
 
-    # בדיקת עמודות
-    need = ("bank_code","bank_amt","books_amt","ref","ref2","details")
-    for k in need:
-        if cols.get(k) not in df.columns:
-            return (match, stats, pd.DataFrame()) if debug else (match, stats)
+    col_bank_code = cols.get("bank_code")
+    col_bank_amt  = cols.get("bank_amt")
+    col_books_amt = cols.get("books_amt")
+    col_ref1      = cols.get("ref")      # אסמכתא 1
+    col_ref2      = cols.get("ref2")     # אסמכתא 2
+    col_details   = cols.get("details")
 
-    # וקטורים מנורמלים
-    v_match = pd.to_numeric(match, errors="coerce").fillna(0)
-    v_code  = df[cols["bank_code"]].apply(_to_number)
-    v_bamt  = df[cols["bank_amt"]].apply(_to_number)     # צד בנק (צפוי חיובי)
-    v_samt  = df[cols["books_amt"]].apply(_to_number)    # צד ספרים (צפוי שלילי)
-    v_det   = df[cols["details"]].astype(str).fillna("")
-    v_r1    = df[cols["ref"]].astype(str).fillna("")
-    v_r2    = df[cols["ref2"]].astype(str).fillna("")
+    # חייבים את כל אלה כדי להריץ את הכלל
+    if not all([col_bank_code, col_bank_amt, col_books_amt, col_ref1, col_ref2, col_details]):
+        return match_values, stats
 
-    # נרמול מזהי שיק
-    r1_digits = v_r1.apply(_only_digits)  # בנק
-    # ספרים: קודם אסמכתא2; אם ריק, ניקח ספרות מאסמכתא1 (CH12345→12345)
-    r2_digits = v_r2.apply(_only_digits)
-    r2_fallback = v_r1.apply(lambda s: _only_digits(_safe_str(s).replace("CH","").replace("ch","")))
-    r2_final = r2_digits.where(r2_digits.ne("0"), r2_fallback)
+    def _num_id(x):
+        s = "" if x is None else str(x).strip()
+        digits = re.sub(r"\D", "", s).lstrip("0")
+        return digits or "0"
 
-    # מועמדים
-    bank_idx = [
-        i for i in df.index
-        if float(v_match.iat[i]) == 0
-           and pd.notna(v_code.iat[i]) and int(v_code.iat[i]) == CHECK_CODE
-           and _contains_any(v_det.iat[i], DETAILS_BANK_KEYWORDS)
-           and pd.notna(v_bamt.iat[i]) and v_bamt.iat[i] > 0
-    ]
-    books_idx = [
-        j for j in df.index
-        if float(v_match.iat[j]) == 0
-           and _safe_str(v_r1.iat[j]).upper().startswith("CH")
-           and _contains_any(v_det.iat[j], DETAILS_BOOKS_KEYWORDS)
-           and pd.notna(v_samt.iat[j]) and v_samt.iat[j] < 0
-    ]
-    stats["bank_candidates"]  = len(bank_idx)
-    stats["books_candidates"] = len(books_idx)
+    bank_code = to_number(df[col_bank_code])
+    bank_amt  = to_number(df[col_bank_amt])
+    books_amt = to_number(df[col_books_amt])
+    details   = df[col_details].astype(str).fillna("")
+    ref1      = df[col_ref1].astype(str).fillna("")
+    ref2      = df[col_ref2].astype(str).fillna("")
 
-    # קיבוץ ספרים לפי מזהה שיק
+    # מועמדי בנק/ספרים לפי הפילטרים
+    bank_idx  = [i for i in df.index
+                 if pd.notna(bank_code.iat[i]) and int(bank_code.iat[i]) == 493
+                 and "שיק" in details.iat[i]
+                 and pd.notna(bank_amt.iat[i]) and bank_amt.iat[i] > 0
+                 and float(match_values.iat[i] or 0) == 0]
+
+    books_idx = [j for j in df.index
+                 if str(ref1.iat[j]).startswith("CH")
+                 and "תשלום בהמחאה" in details.iat[j]
+                 and pd.notna(books_amt.iat[j]) and books_amt.iat[j] < 0
+                 and float(match_values.iat[j] or 0) == 0]
+
+    # מיפוי אסמכתא2 (בספרים) מנורמלת -> רשימת שורות ספרים
     books_by_id = {}
     for j in books_idx:
-        books_by_id.setdefault(r2_final.iat[j], []).append(j)
+        k = _num_id(ref2.iat[j])
+        books_by_id.setdefault(k, []).append(j)
 
     used_books = set()
-    debug_rows = []
-
     for i in bank_idx:
-        key = r1_digits.iat[i]
-        candidates = [j for j in books_by_id.get(key, []) if j not in used_books]
-
+        key = _num_id(ref1.iat[i])   # אסמכתא 1 בצד בנק
+        cands = [j for j in books_by_id.get(key, []) if j not in used_books]
         chosen = None
-        for j in candidates:
-            ok_amount = abs(float(v_bamt.iat[i]) + float(v_samt.iat[j])) <= tol
-            if ok_amount:
+        for j in cands:
+            if abs(float(bank_amt.iat[i]) + float(books_amt.iat[j])) <= AMOUNT_TOL_4:
                 chosen = j
                 break
-
         if chosen is not None:
-            v_match.iat[i] = 4
-            v_match.iat[chosen] = 4
+            match_values.iat[i] = 4
+            match_values.iat[chosen] = 4
             used_books.add(chosen)
             stats["pairs"] += 1
-        else:
-            stats["no_amount_match"] += 1
 
-        if debug:
-            debug_rows.append({
-                "bank_row": i,
-                "bank_ref1_digits": key,
-                "bank_amount": v_bamt.iat[i],
-                "books_candidates": candidates,
-            })
+    return match_values, stats
 
-    if debug:
-        dbg = pd.DataFrame(debug_rows)
-        return v_match, stats, dbg
-
-    return v_match, stats
 
