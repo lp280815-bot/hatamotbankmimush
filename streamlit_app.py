@@ -9,15 +9,15 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.page import PageMargins
 
-# ---------- UI ----------
-st.set_page_config(page_title="התאמות 1+2+3+4 + הוראת קבע + VLOOKUP", page_icon="✅", layout="centered")
+# ---------- UI בסיס ----------
+st.set_page_config(page_title="התאמות 1+2+3+4 + הוראת קבע + VLOOKUP + עזר", page_icon="✅", layout="centered")
 st.markdown("""
 <style>
 html, body, [class*="css"] { direction: rtl; text-align: right; }
 .block-container{padding-top:1rem}
 </style>
 """, unsafe_allow_html=True)
-st.title("התאמות לקוחות/בנק – 1+2+3+4 + גיליון „הוראת קבע ספקים” + כללי VLOOKUP")
+st.title("התאמות לקוחות/בנק – 1+2+3+4 (A2) + „הוראת קבע ספקים” + VLOOKUP + קובץ עזר (XLSX)")
 
 # ---------- קבועים ----------
 OVRC_CODES       = {120, 175}     # כלל 1 – OV/RC
@@ -39,7 +39,7 @@ HEADER_BLUE = PatternFill(start_color="9BC2E6", end_color="9BC2E6", fill_type="s
 THIN = Side(style='thin', color='CCCCCC')
 BORDER = Border(top=THIN, bottom=THIN, left=THIN, right=THIN)
 
-# ---------- עזר ----------
+# ---------- עזר כללי ----------
 def _s(x):  return "" if x is None else str(x)
 def _digits(x): 
     s = re.sub(r"\D","",_s(x)).lstrip("0"); return s or "0"
@@ -95,7 +95,6 @@ def load_rules_from_disk():
         try:
             data = json.load(open(RULES_PATH,"r",encoding="utf-8"))
             st.session_state.name_map.update(data.get("name_map", {}))
-            # מפתח סכום נשמר כטקסט—נמיר למספר עפי צורך בזמן שימוש
             st.session_state.amount_map.update(data.get("amount_map", {}))
         except Exception:
             pass
@@ -107,25 +106,68 @@ def save_rules_to_disk():
                    "amount_map":st.session_state.amount_map}, f, ensure_ascii=False, indent=2)
 
 def map_supplier_by_rules(name_text: str, amount_val) -> str:
-    """מאתר מס' ספק לפי שם/פרטים או לפי סכום מוחלט (עם גיבויי 'עגול')."""
+    """מאתר מס' ספק לפי שם/פרטים או לפי סכום מוחלט (עם גיבוי 'עגול')."""
     sname = _s(name_text).strip()
     if sname in st.session_state.name_map:
         return st.session_state.name_map[sname]
-    # מכיל (substring)
     for k,v in st.session_state.name_map.items():
         if k and k in sname:
             return v
     if amount_val is not None and not pd.isna(amount_val):
-        # ניסיון מדויק
         key = str(round(abs(float(amount_val)), 2))
         if key in st.session_state.amount_map:
             return st.session_state.amount_map[key]
-        # ניסיון 'עגול' (ללא חלק עשרוני)
         key2 = str(int(round(abs(float(amount_val)))))
         return st.session_state.amount_map.get(key2, "")
     return ""
 
-# ---------- כללים ----------
+# ---------- ייבוא כללים מקובץ עזר (XLSX) ----------
+def import_rules_from_excel_bytes(xls_bytes: bytes) -> int:
+    """
+    קורא קובץ עזר XLSX ומוסיף כללים:
+      גיליון 'שם→ספק'   עם עמודות:  'שם/פרטים' | 'מס' ספק'
+      גיליון 'סכום→ספק' עם עמודות:  'סכום'     | 'מס' ספק'
+    מחזיר כמה כללים הוטמעו.
+    """
+    try:
+        buf = io.BytesIO(xls_bytes)
+        x = pd.ExcelFile(buf)
+        added = 0
+
+        if "שם→ספק" in x.sheet_names:
+            df_n = pd.read_excel(x, "שם→ספק").fillna("")
+            name_col = next((c for c in df_n.columns if "שם" in str(c) or "פרטים" in str(c)), None)
+            supp_col = next((c for c in df_n.columns if "ספק" in str(c)), None)
+            if name_col and supp_col:
+                for _, r in df_n.iterrows():
+                    k = str(r[name_col]).strip()
+                    v = str(r[supp_col]).strip()
+                    if k and v:
+                        st.session_state.name_map[k] = v
+                        added += 1
+
+        if "סכום→ספק" in x.sheet_names:
+            df_a = pd.read_excel(x, "סכום→ספק").fillna("")
+            amt_col = next((c for c in df_a.columns if "סכום" in str(c)), None)
+            supp_col = next((c for c in df_a.columns if "ספק" in str(c)), None)
+            if amt_col and supp_col:
+                for _, r in df_a.iterrows():
+                    raw = str(r[amt_col]).replace(",", "").strip()
+                    try:
+                        key = str(round(abs(float(raw)), 2))
+                    except Exception:
+                        key = raw
+                    v = str(r[supp_col]).strip()
+                    if key and v:
+                        st.session_state.amount_map[key] = v
+                        added += 1
+
+        save_rules_to_disk()
+        return added
+    except Exception:
+        return 0
+
+# ---------- כללי התאמה ----------
 def rule_1(df, cols, match):
     stats={"pairs":0}
     bamt,samt,ref,date,code = cols["bank_amt"],cols["books_amt"],cols["ref"],cols["date"],cols["bank_code"]
@@ -185,6 +227,7 @@ def rule_3(df, cols, match):
     return match,stats
 
 def rule_4(df, cols, match):
+    """שיקים ספקים – ללא בדיקת תאריכים, A2, נרמול אסמכתאות, טולרנס ₪0.20."""
     stats={"pairs":0}
     code,bamt,samt,ref1,ref2,det = cols["bank_code"],cols["bank_amt"],cols["books_amt"],cols["ref"],cols["ref2"],cols["details"]
     if not all([code,bamt,samt,ref1,ref2,det]): return match,stats
@@ -195,9 +238,9 @@ def rule_4(df, cols, match):
     rid = r2d.where(r2d.ne("0"), r2fb)
 
     bank_idx=[i for i in df.index if float(match.iat[i]) in (0,2,3)
-              and pd.notna(c.iat[i]) and int(c.iat[i])==CHECK_CODE and "שיק" in de.iat[i] and ba.iat[i]>0]
+              and pd.notna(c.iat[i]) and int(c.iat[i])==CHECK_CODE and ("שיק" in de.iat[i]) and ba.iat[i]>0]
     books_idx=[j for j in df.index if float(match.iat[j]) in (0,2,3)
-               and _s(r1.iat[j]).upper().startswith("CH") and ("תשלום בהמחאה" in de.iat[j] or "המחאה" in de.iat[j]) and sa.iat[j]<0]
+               and _s(r1.iat[j]).upper().startswith("CH") and (("תשלום בהמחאה" in de.iat[j]) or ("המחאה" in de.iat[j])) and sa.iat[j]<0]
     books_by_id={}
     for j in books_idx: books_by_id.setdefault(rid.iat[j], []).append(j)
     used=set()
@@ -260,9 +303,8 @@ def process_workbook(xls_bytes: bytes):
     # גיליון „הוראת קבע ספקים”
     if standing_all:
         vk = pd.concat(standing_all, ignore_index=True)
-        # הוספת „מס' ספק” לפי כללי VLOOKUP
         vk["מס' ספק"] = vk.apply(lambda r: map_supplier_by_rules(r.get("פרטים",""), r.get("סכום", np.nan)), axis=1)
-        # עמודות עזר לסיכומי חובה/זכות (לא חובה אבל נוח)
+        # עמודות עזר סכום חובה/זכות (לא חובה, אך שימושי)
         if "סכום" in vk.columns:
             vk["סכום חובה"] = vk["סכום"].apply(lambda x: abs(x) if pd.notna(x) and x<0 else 0.0)
             vk["סכום זכות"] = vk["סכום"].apply(lambda x: abs(x) if pd.notna(x) and x>0 else 0.0)
@@ -281,8 +323,8 @@ def process_workbook(xls_bytes: bytes):
     out = io.BytesIO(); wb.save(out)
     return out.getvalue(), pd.DataFrame(summary)
 
-# ---------- UI – כללי VLOOKUP ----------
-st.subheader("⚙️ עדכון כללי VLOOKUP (שם/פרטים ↔ מס' ספק, סכום ↔ מס' ספק)")
+# ---------- UI – כללי VLOOKUP + עזר ----------
+st.subheader("⚙️ כללי VLOOKUP (שם/פרטים ↔ מס' ספק, סכום ↔ מס' ספק)")
 mode = st.radio("סוג עדכון", ["לפי פרטים (שם)", "לפי סכום"], horizontal=True)
 ca, cb, cc = st.columns([2,1,1])
 
@@ -294,11 +336,10 @@ if mode == "לפי פרטים (שם)":
             st.session_state.name_map[_s(key_name).strip()] = _s(val_supp).strip()
             save_rules_to_disk(); st.success("נשמר.")
 else:
-    key_amt = ca.text_input("סכום (יוזן כמספר או טקסט, נשמר כמחרוזת מעוגלת)")
+    key_amt = ca.text_input("סכום (יוזן כמספר או טקסט; נשמר כמחרוזת מעוגלת)")
     val_supp2 = cb.text_input("מס' ספק")
     if cc.button("➕ הוסף/עדכן"):
         if key_amt and val_supp2:
-            # נשמור מפתח כטקסט של סכום מוחלט מעוגל ל-2 ספרות (כמו בעיבוד)
             try:
                 k = str(round(abs(float(key_amt)),2))
             except Exception:
@@ -306,19 +347,22 @@ else:
             st.session_state.amount_map[k] = _s(val_supp2).strip()
             save_rules_to_disk(); st.success("נשמר.")
 
-c1,c2,c3,c4 = st.columns([1,1,1,2])
+st.markdown("**(אופציונלי)** ייבוא כללים מקובץ עזר (XLSX) עם גיליונות 'שם→ספק' ו-'סכום→ספק'")
+aux_rules_file = st.file_uploader("קובץ עזר לכללים (xlsx)", type=["xlsx"], key="aux_rules_file")
+if st.button("📥 ייבוא כללים מקובץ עזר (xlsx)"):
+    if aux_rules_file is None:
+        st.warning("לא נבחר קובץ.")
+    else:
+        n = import_rules_from_excel_bytes(aux_rules_file.read())
+        if n > 0: st.success(f"ייובאו {n} כללים מקובץ העזר ונשמרו.")
+        else:     st.error("לא נמצאו גיליונות/עמודות מתאימים בקובץ העזר.")
+
+c1,c2 = st.columns(2)
 c1.download_button("⬇️ ייצוא JSON",
     data=json.dumps({"name_map":st.session_state.name_map,"amount_map":st.session_state.amount_map},
                     ensure_ascii=False, indent=2).encode("utf-8"),
     file_name="rules_store.json", mime="application/json")
-uploaded_rules = c2.file_uploader("⬆️ ייבוא JSON", type=["json"], label_visibility="collapsed")
-if c3.button("ייבוא והחלפה"):
-    if uploaded_rules is not None:
-        data = json.loads(uploaded_rules.read().decode("utf-8"))
-        st.session_state.name_map = { _s(k).strip(): v for k,v in data.get("name_map",{}).items() }
-        st.session_state.amount_map = { _s(k).strip(): v for k,v in data.get("amount_map",{}).items() }
-        save_rules_to_disk(); st.success("יובא ונשמר.")
-if c4.button("איפוס כללים"):
+if c2.button("איפוס כללים"):
     st.session_state.name_map = {}; st.session_state.amount_map = {}; save_rules_to_disk(); st.warning("נוקה.")
 
 st.dataframe(pd.DataFrame({"שם/פרטים": list(st.session_state.name_map.keys()),
@@ -332,8 +376,15 @@ st.divider()
 
 # ---------- UI – הרצה ----------
 main = st.file_uploader("בחרי קובץ אקסל מקור (xlsx)", type=["xlsx"])
+aux_rules_for_run = st.file_uploader("(אופציונלי) קובץ עזר לכללי VLOOKUP (xlsx) – טעינה אוטומטית לפני הריצה", type=["xlsx"], key="aux_rules_for_run")
 
 if st.button("▶️ הרצה – 1+2+3+4 + גיליון הוראת קבע + VLOOKUP") and main is not None:
+    # ייבוא כללים אוטומטי אם הועלה קובץ עזר
+    if aux_rules_for_run is not None:
+        n = import_rules_from_excel_bytes(aux_rules_for_run.read())
+        if n > 0:
+            st.info(f"ייובאו {n} כללים מקובץ העזר לפני העיבוד.")
+
     with st.spinner("מריץ את כל הכללים..."):
         out_bytes, summary_df = process_workbook(main.read())
     st.success("מוכן! אפשר להוריד.")
@@ -343,4 +394,4 @@ if st.button("▶️ הרצה – 1+2+3+4 + גיליון הוראת קבע + VLO
         file_name="תוצאה סופית - 1+2+3+4 + הוראת קבע.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
-    st.info("העלאי קובץ מקור ולחצי הרצה.")
+    st.info("העלאי קובץ מקור, ואם תרצי — הוסיפי קובץ עזר לכללים, ואז הרצה.")
