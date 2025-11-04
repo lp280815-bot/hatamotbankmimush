@@ -1,13 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-התאמות בנק – 1 עד 12
-1–4: OV/RC, הוראות קבע (VLOOKUP), העברות (#3), שיקים ספקים (#4)
-5–10: עמלות, פאיימי, שיקים ממשמרת, הפק' שיק-שידור, הפק.שיק במכונה, קודים
-11–12: placeholders (לא מסמנים עד שתקבלי לוגיקה)
-תיקונים:
-- כלל 3 מסמן גם צד ספרים לפי קובץ עזר (מס' תשלום) + סכומים לפי תאריך.
-- גיליון 'הוראת קבע ספקים' צובע כתום שורות בלי מס' ספק.
-- פריסת עמוד A4 לרוחב, Fit-to-width=1, שוליים, RTL.
+התאמות בנק – 1 עד 12 (מתוקן)
+- כלל 3: סימון גם צד בנק וגם צד ספרים לפי עזר (תאריך+סכום יומי; ומס' תשלום)
+- 'הוראת קבע ספקים': כל השורות בחובה; שורת סיכום 20001 בלבד בזכות (סכום של שורות עם מס' ספק)
+- צביעת כתום לשורות בלי מס' ספק; RTL; פריסת עמוד A4 לרוחב, Fit-to-width=1
 """
 
 import io, os, re, json
@@ -30,19 +26,19 @@ html, body, [class*="css"] { direction: rtl; text-align: right; }
 st.title("התאמות בנק – 1 עד 12")
 
 # ---------- Constants ----------
-STANDING_CODES = {469, 515}
-OVRC_CODES     = {120, 175}
-TRANSFER_CODE  = 485
-TRANSFER_PHRASE = "העב' במקבץ-נט"
-RULE4_CODE     = 493
+STANDING_CODES = {469, 515}           # כלל 2
+OVRC_CODES     = {120, 175}           # כלל 1
+TRANSFER_CODE  = 485                  # כלל 3
+TRANSFER_PHRASE = "העב' במקבץ-נט"     # כלל 3
+RULE4_CODE     = 493                  # כלל 4
 RULE4_EPS      = 0.50
 
-RULE5_CODES = {453, 472, 473, 124}
-RULE6_COMPANY = 'פאיימי בע"מ'
-RULE7_CODE = 143; RULE7_PHRASE = "שיקים ממשמרת"
-RULE8_CODE = 191; RULE8_PHRASE = "הפק' שיק-שידור"
-RULE9_CODE = 205; RULE9_PHRASE = "הפק.שיק במכונה"
-RULE10_CODES = {191, 132, 396}
+RULE5_CODES = {453, 472, 473, 124}    # כלל 5
+RULE6_COMPANY = 'פאיימי בע"מ'         # כלל 6
+RULE7_CODE = 143; RULE7_PHRASE = "שיקים ממשמרת"      # כלל 7
+RULE8_CODE = 191; RULE8_PHRASE = "הפק' שיק-שידור"    # כלל 8
+RULE9_CODE = 205; RULE9_PHRASE = "הפק.שיק במכונה"   # כלל 9
+RULE10_CODES = {191, 132, 396}        # כלל 10
 
 # placeholders 11–12
 def rule11_placeholder(df, match_col, code_col, bamt_col, details_col): return df[match_col]
@@ -108,9 +104,13 @@ def vk_save(store):
     with open(VK_FILE,"w",encoding="utf-8") as f: json.dump(store,f,ensure_ascii=False,indent=2)
 
 def build_vlookup_sheet(datasheet_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    כל השורות -> 'סכום חובה'.
+    מוסיף בסוף שורת '20001' בזכות = סה״כ חובה של שורות עם מס' ספק בלבד.
+    """
     store = vk_load()
-    name_map   = {str(k): v for k,v in store.get("name_map",{}).items()}
-    amount_map = {float(k): v for k,v in store.get("amount_map",{}).items()}
+    name_map   = {str(k): v for k, v in store.get("name_map", {}).items()}
+    amount_map = {float(k): v for k, v in store.get("amount_map", {}).items()}
 
     col_match = pick_col(datasheet_df, MATCH_COLS) or datasheet_df.columns[0]
     col_bamt  = pick_col(datasheet_df, BANK_AMTS)
@@ -124,6 +124,7 @@ def build_vlookup_sheet(datasheet_df: pd.DataFrame) -> pd.DataFrame:
     if vk.empty:
         return pd.DataFrame(columns=["פרטים","סכום","מס' ספק","סכום חובה","סכום זכות"])
 
+    # מציאת ספק: תחילה לפי שם (contains), אח"כ לפי סכום מוחלט
     def pick_supplier(row):
         s = str(row["פרטים"])
         for k,v in name_map.items():
@@ -135,8 +136,21 @@ def build_vlookup_sheet(datasheet_df: pd.DataFrame) -> pd.DataFrame:
             return ""
 
     vk["מס' ספק"]   = vk.apply(pick_supplier, axis=1)
-    vk["סכום חובה"] = vk["סכום"].apply(lambda x: abs(x) if pd.notna(x) and x<0 else 0.0)
-    vk["סכום זכות"] = vk["סכום"].apply(lambda x: abs(x) if pd.notna(x) and x>0 else 0.0)
+    # לפי הבקשה: כל הסכום בצד חובה בלבד
+    vk["סכום חובה"] = vk["סכום"].apply(lambda x: abs(x) if pd.notna(x) else 0.0)
+    vk["סכום זכות"] = 0.0
+
+    # שורת סיכום 20001 — רק אם יש מס' ספק בשורות
+    total_hova_with_supplier = vk.loc[vk["מס' ספק"].astype(str).str.len()>0, "סכום חובה"].sum()
+    if total_hova_with_supplier and total_hova_with_supplier != 0:
+        vk = pd.concat([vk, pd.DataFrame([{
+            "פרטים": "סה\"כ זכות – עם מס' ספק",
+            "סכום": 0.0,
+            "מס' ספק": 20001,
+            "סכום חובה": 0.0,
+            "סכום זכות": round(float(total_hova_with_supplier), 2)
+        }])], ignore_index=True)
+
     return vk
 
 # ---------- Rules 1–4 ----------
@@ -167,30 +181,22 @@ def apply_rules_1_4(df: pd.DataFrame) -> pd.DataFrame:
     for i in range(len(out)):
         if match.iat[i]!=0: continue
         if pd.notna(code.iat[i]) and int(code.iat[i]) in OVRC_CODES and pd.notna(bamt.iat[i]) and bamt.iat[i] < 0 and pd.notna(datev.iat[i]):
-            k=(round(abs(float(bamt.iat[i])),2), datev.iat[i])
-            bank_keys.setdefault(k, []).append(i)
+            k=(round(abs(float(bamt.iat[i])),2), datev.iat[i]); bank_keys.setdefault(k, []).append(i)
     for j in range(len(out)):
         if match.iat[j]!=0: continue
         if pd.notna(aamt.iat[j]) and aamt.iat[j]>0 and pd.notna(datev.iat[j]) and str(ref1.iat[j]).upper().startswith(("OV","RC")):
-            k=(round(abs(float(aamt.iat[j])),2), datev.iat[j])
-            books_keys.setdefault(k, []).append(j)
+            k=(round(abs(float(aamt.iat[j])),2), datev.iat[j]); books_keys.setdefault(k, []).append(j)
     for k, bidx in bank_keys.items():
         if len(bidx)==1 and len(books_keys.get(k,[]))==1:
             i=bidx[0]; j=books_keys[k][0]
-            if match.iat[i]==0 and match.iat[j]==0:
-                match.iat[i]=1; match.iat[j]=1
+            if match.iat[i]==0 and match.iat[j]==0: match.iat[i]=1; match.iat[j]=1
 
     # 2: Standing orders
     for i in range(len(out)):
         if match.iat[i]==0 and pd.notna(code.iat[i]) and int(code.iat[i]) in STANDING_CODES:
             match.iat[i]=2
 
-    # 3: Transfers – בנק + ספרים (ספרים לפי מס' תשלום מהעזר)
-    # בנק: קוד 485, סכום חיובי, פרטים מכילים את הטקסט
-    # ספרים: אסמכתא 1 ∈ קבוצת מס' תשלום לאותו יום
-    # סימון לא דורס ערכים !=0
-    # => סימון שני הצדדים = 3
-    # (הטעינה של העזר נעשית בהמשך ב-process_workbook)
+    # 3: בנק יסומן בשלב process_workbook (עם קובץ העזר) יחד עם ספרים
     out[col_match] = match
     return out
 
@@ -225,13 +231,12 @@ def apply_rules_5_12(df: pd.DataFrame) -> pd.DataFrame:
 def style_and_print(wb):
     for ws in wb.worksheets:
         ws.sheet_view.rightToLeft = True
-        # A4 landscape, fit to width, margins
-        ws.page_setup.paperSize = 9           # A4
+        ws.page_setup.paperSize = 9      # A4
         ws.page_setup.orientation = 'landscape'
         ws.page_setup.fitToWidth = 1
         ws.page_setup.fitToHeight = 0
         ws.page_margins = PageMargins(left=0.4, right=0.4, top=0.6, bottom=0.6)
-    # כתום לשורות בלי 'מס' ספק' בגיליון הוראת קבע
+
     if "הוראת קבע ספקים" in wb.sheetnames:
         ws = wb["הוראת קבע ספקים"]
         header = {cell.value: idx for idx, cell in enumerate(ws[1], start=1)}
@@ -243,26 +248,25 @@ def style_and_print(wb):
                 if v in ("", None):
                     for c in range(1, ws.max_column+1):
                         ws.cell(row=r, column=c).fill = orange
-        # בולד לשורה האחרונה
         for cell in ws[ws.max_row]:
             cell.font = Font(bold=True)
 
 # ---------- Processing ----------
 def process_workbook(main_bytes: bytes, aux_bytes: bytes|None):
-    # load main
     wb = load_workbook(io.BytesIO(main_bytes), data_only=True)
     ws = wb["DataSheet"] if "DataSheet" in wb.sheetnames else wb.worksheets[0]
     df = ws_to_df(ws)
     if df.empty: return None, None, None
 
-    # 1–4
+    # 1–4 (ללא כלל 3-בנק)
     df = apply_rules_1_4(df)
 
-    # === Rule 3 (with AUX) — בנק + ספרים ===
+    # === כלל 3 – עזר: בנק + ספרים ===
     if aux_bytes is not None:
         aux_wb = load_workbook(io.BytesIO(aux_bytes), data_only=True)
         a_ws   = aux_wb.worksheets[0]
         a_df   = ws_to_df(a_ws)
+
         c_dt   = pick_col(a_df, AUX_DATE_KEYS)
         c_amt  = pick_col(a_df, AUX_AMT_KEYS)
         c_pay  = pick_col(a_df, AUX_PAYNO_KEYS)
@@ -281,48 +285,44 @@ def process_workbook(main_bytes: bytes, aux_bytes: bytes|None):
                           .apply(lambda s: set(s.dropna().astype(str)))
                           .to_dict())
 
-            # locate columns in df
             col_match = pick_col(df, MATCH_COLS) or df.columns[0]
             col_code  = pick_col(df, BANK_CODES)
             col_bamt  = pick_col(df, BANK_AMTS)
             col_det   = pick_col(df, DETAILS)
             col_ref1  = pick_col(df, REF1S)
+            col_date  = pick_col(df, DATES)
 
             match = pd.to_numeric(df[col_match], errors="coerce").fillna(0).astype(int)
             code  = to_num(df[col_code])
             bamt  = to_num(df[col_bamt]).round(2)
             det   = df[col_det].astype(str).fillna("")
-            # books side:
             ref1  = df[col_ref1].astype(str).fillna("") if col_ref1 else pd.Series([""]*len(df))
-            datev = norm_date(pd.to_datetime(df[pick_col(df, DATES)], errors="coerce")) if pick_col(df, DATES) else pd.Series([pd.NaT]*len(df))
+            datev = norm_date(pd.to_datetime(df[col_date], errors="coerce")) if col_date else pd.Series([pd.NaT]*len(df))
 
-            bank_mask = (code==TRANSFER_CODE) & (bamt>0) & (det.str.contains(TRANSFER_PHRASE, na=False))
+            bank_mask = (match==0) & (code==TRANSFER_CODE) & (bamt>0) & (det.str.contains(TRANSFER_PHRASE, na=False))
             for gdt, gsum in groups.items():
-                # bank rows match by amount & date
-                rows_bank = df.index[ bank_mask & (bamt.abs()==abs(gsum)) & (datev==gdt) & (match==0) ].tolist()
-                for i in rows_bank: match.iat[i]=3
-                # books rows match by pay numbers (if available)
+                # סימון צד בנק לפי סכום יומי ותאריך
+                ixs_bank = df.index[ bank_mask & (bamt.abs()==abs(gsum)) & (datev==gdt) ].tolist()
+                for i in ixs_bank:
+                    match.iat[i] = 3
+                # סימון צד ספרים לפי מס' תשלום לאותו יום
                 payset = pays.get(gdt, set())
-                if payset and len(payset)>0 and col_ref1:
-                    rows_books = df.index[(ref1.astype(str).isin(payset)) & (match==0)].tolist()
-                    for j in rows_books: match.iat[j]=3
-            df[col_match]=match
+                if payset and col_ref1:
+                    ixs_books = df.index[(match==0) & (ref1.astype(str).isin(payset))].tolist()
+                    for j in ixs_books:
+                        match.iat[j] = 3
+            df[col_match] = match
 
     # 5–12 (רק על 0)
     df = apply_rules_5_12(df)
-
-    # build vlookup sheet
     vk_df = build_vlookup_sheet(df)
 
-    # export with styling & print setup
+    # יצוא עם עיצוב
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as wr:
         df.to_excel(wr, index=False, sheet_name="DataSheet")
-        pd.DataFrame({"מס": pd.to_numeric(df[pick_col(df,MATCH_COLS) or df.columns[0]], errors="coerce")
-                       .fillna(0).astype(int).value_counts().sort_index().index,
-                      "כמות": pd.to_numeric(df[pick_col(df,MATCH_COLS) or df.columns[0]], errors="coerce")
-                       .fillna(0).astype(int).value_counts().sort_index().values
-                     }).to_excel(wr, index=False, sheet_name="סיכום")
+        counts = pd.to_numeric(df[pick_col(df, MATCH_COLS) or df.columns[0]], errors="coerce").fillna(0).astype(int).value_counts().sort_index()
+        pd.DataFrame({"מס":counts.index,"כמות":counts.values}).to_excel(wr, index=False, sheet_name="סיכום")
         vk_df.to_excel(wr, index=False, sheet_name="הוראת קבע ספקים")
     wb_out = load_workbook(io.BytesIO(buffer.getvalue()))
     style_and_print(wb_out)
@@ -352,6 +352,7 @@ if st.button("הרצה 1–12"):
                                file_name="התאמות_1_עד_12.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+# אזור ניהול מפות ל-VLOOKUP (אופציונלי)
 st.divider()
 st.subheader("🔎 VLOOKUP – הוראת קבע ספקים (עריכה ושמירה)")
 store = vk_load()
