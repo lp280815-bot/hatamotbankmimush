@@ -41,7 +41,7 @@ RULE4_EPS      = 0.50               # טולרנס כלל 4
 RULE3_AMOUNT_EPS = 0.00
 
 # כללים 5–10
-RULE5_CODES = {453, 472, 473, 124}  # עמלות – חיובי ועד 500
+RULE5_CODES = {453, 472, 473, 124}  # עמלות – חיובי ועד 1000
 RULE6_COMPANY = 'פאיימי בע"מ'       # קוד 175, שלילי, פרטים בדיוק
 RULE7_CODE = 143; RULE7_PHRASE = "שיקים ממשמרת"
 RULE8_CODE = 191; RULE8_PHRASE = "הפק' שיק-שידור"
@@ -234,7 +234,7 @@ def apply_rules_5_12(df: pd.DataFrame) -> pd.DataFrame:
     bamt  = to_num(out[col_bamt]) if col_bamt else pd.Series([np.nan]*len(out))
     det   = out[col_det].astype(str).fillna("") if col_det else pd.Series([""]*len(out))
 
-    m5  = (match==0) & (code.isin(list(RULE5_CODES))) & (bamt>0) & (bamt<=500); match.loc[m5]=5
+    m5  = (match==0) & (code.isin(list(RULE5_CODES))) & (bamt>0) & (bamt<=1000); match.loc[m5]=5
     m6  = (match==0) & (code==175) & (bamt<0) & (det==RULE6_COMPANY); match.loc[m6]=6
     m7  = (match==0) & (code==RULE7_CODE) & (bamt<0) & (det==RULE7_PHRASE); match.loc[m7]=7
     m8  = (match==0) & (code==RULE8_CODE) & (bamt<0) & (det==RULE8_PHRASE); match.loc[m8]=8
