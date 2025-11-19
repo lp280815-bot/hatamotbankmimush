@@ -1,23 +1,44 @@
 # -*- coding: utf-8 -*-
 """
-התאמות בנק – 1 עד 12 (גרסת סכומים קשיחה לכלל 3)
+התאמות בנק – 1 עד 12 + התאמות ספקים (גיול חובות)
 - כלל 1: OV/RC 1:1 (תאריך+סכום)
-- כלל 2: הוראות קבע (469/515) + 'הוראת קבע ספקים': כל השורות בחובה; שורת סיכום 20001 בזכות = סה״כ חובה של שורות עם מס’ ספק. שורות בלי מס’ ספק צבועות כתום.
+- כלל 2: הוראות קבע (469/515) + 'הוראת קבע ספקים': כל השורות בחובה; שורת סיכום 20001 בזכות = סה״כ חובה של שורות עם מס' ספק. שורות בלי מס' ספק צבועות כתום.
 - כלל 3: העברות (485, 'העב' במקבץ-נט') – מסמן רק אם קיים צד בנק וגם צד ספרים ושוויי־סכום (במונחי ערך מוחלט). אין דרישת התאמת תאריך. אם אין התאמה → גיליון 'פערי סכומים – כלל 3'.
 - כלל 4: שיקים ספקים (493) עם טולרנס סכום על התאמת אסמכתאות (Ref1 בנק ↔ Ref2 ספרים).
 - כללים 5–10: לפי הלוגיקה שאישרת.
 - 11–12: placeholders.
 - עיצוב: RTL, A4 לרוחב, Fit-to-width=1, שוליים נוחים.
+
+התאמות ספקים (גיול חובות):
+- כלל ראשון: 100% התאמה - חוב מצטבר בין -2 ל-2 ש"ח
+- כלל שני: 80% התאמה - יש יתרה 0 בין השורות אבל חוב מצטבר סופי > 2
+- כלל שלישי: שליחת מייל לספקים עם העברות חסרות חשבונית
 """
 
-import io, os, re, json
+import io, os, re, json, smtplib
 from datetime import datetime
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 import numpy as np
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font
 from openpyxl.worksheet.page import PageMargins
+
+# Import database module
+import database as db
+
+# Initialize database on app start
+@st.cache_resource
+def init_app_database():
+    """Initialize database once per app session"""
+    db.init_database()
+    # Migrate from JSON if exists
+    db.migrate_from_json()
+    return True
+
+init_app_database()
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="התאמות בנק – 1 עד 12", page_icon="✅", layout="centered")
@@ -101,26 +122,251 @@ def ws_to_df(ws):
 
 def only_digits(s): return re.sub(r"\D","", str(s)).lstrip("0") or "0"
 
-# ---------------- VLOOKUP store ----------------
-VK_FILE = "rules_store.json"
-def vk_load():
-    if os.path.exists(VK_FILE):
-        try:
-            with open(VK_FILE,"r",encoding="utf-8") as f: return json.load(f)
-        except Exception: pass
-    return {"name_map": {}, "amount_map": {}}
-def vk_save(store):
-    with open(VK_FILE,"w",encoding="utf-8") as f: json.dump(store,f,ensure_ascii=False,indent=2)
+# ---------------- התאמות ספקים (גיול חובות) ----------------
+def parse_supplier_aging(df: pd.DataFrame):
+    """
+    מנתח קובץ גיול חובות ומחלק לספקים בודדים.
+    מזהה שורות של "חשבון: XXXX, תאור חשבון: שם ספק" ו"סה"כ לחשבון"
 
+    Returns:
+        list of dict: כל ספק עם הנתונים שלו
+    """
+    suppliers = []
+    current_supplier = None
+    current_rows = []
+
+    # מציאת עמודות
+    col_total_debt = None
+    for col in df.columns:
+        if 'חוב מצטבר' in str(col):
+            col_total_debt = col
+            break
+
+    if col_total_debt is None:
+        return []
+
+    # מעבר על השורות
+    for idx, row in df.iterrows():
+        first_col = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
+
+        # זיהוי תחילת ספק
+        if first_col.startswith("חשבון:"):
+            # שמירת ספק קודם אם קיים
+            if current_supplier is not None:
+                suppliers.append({
+                    'account_num': current_supplier['account_num'],
+                    'account_name': current_supplier['account_name'],
+                    'rows': current_rows.copy(),
+                    'total_debt': current_supplier['total_debt']
+                })
+
+            # התחלת ספק חדש
+            parts = first_col.split(',')
+            account_num = parts[0].replace('חשבון:', '').strip()
+            account_name = parts[1].replace('תאור חשבון:', '').strip() if len(parts) > 1 else ""
+
+            current_supplier = {
+                'account_num': account_num,
+                'account_name': account_name,
+                'total_debt': 0
+            }
+            current_rows = []
+
+        # זיהוי סיום ספק
+        elif first_col.startswith('סה"כ לחשבון:') or first_col.startswith('סה״כ לחשבון:'):
+            if current_supplier is not None:
+                # שליפת חוב מצטבר סופי
+                total_debt_val = row[col_total_debt]
+                if pd.notna(total_debt_val):
+                    try:
+                        total_debt_val = float(str(total_debt_val).replace(',', '').replace('₪', ''))
+                    except:
+                        total_debt_val = 0
+                else:
+                    total_debt_val = 0
+
+                current_supplier['total_debt'] = total_debt_val
+                suppliers.append({
+                    'account_num': current_supplier['account_num'],
+                    'account_name': current_supplier['account_name'],
+                    'rows': current_rows.copy(),
+                    'total_debt': total_debt_val
+                })
+                current_supplier = None
+                current_rows = []
+
+        # שורת תנועה רגילה
+        elif current_supplier is not None and not first_col.startswith("תאריך"):
+            # בדיקה שיש תוכן בשורה
+            if pd.notna(row.iloc[0]) or any(pd.notna(row.iloc[i]) for i in range(len(row))):
+                current_rows.append(row.to_dict())
+
+    return suppliers
+
+def classify_suppliers(suppliers: list):
+    """
+    מסווג ספקים לפי הכללים:
+    - כלל 1 (100%): חוב מצטבר בין -2 ל-2
+    - כלל 2 (80%): חוב מצטבר > 2 אבל יש שורה עם חוב מצטבר = 0
+    - כלל 3: יש העברות ולא נכנס לכלל 1 או 2
+    """
+    rule1_suppliers = []  # 100% התאמה
+    rule2_suppliers = []  # 80% התאמה
+    rule3_suppliers = []  # העברות חסרות
+
+    for supplier in suppliers:
+        total_debt = supplier['total_debt']
+        rows = supplier['rows']
+
+        # כלל 1: חוב מצטבר בין -2 ל-2
+        if -2 <= total_debt <= 2:
+            rule1_suppliers.append(supplier)
+        else:
+            # בדיקה אם יש שורה עם חוב מצטבר = 0 (או קרוב ל-0)
+            has_zero_debt_row = False
+            for row in rows:
+                row_debt = row.get('חוב מצטבר', None)
+                if pd.notna(row_debt):
+                    try:
+                        debt_val = float(str(row_debt).replace(',', '').replace('₪', ''))
+                        if -2 <= debt_val <= 2:
+                            has_zero_debt_row = True
+                            break
+                    except:
+                        pass
+
+            if has_zero_debt_row:
+                # כלל 2: יש יתרה 0 בין השורות
+                rule2_suppliers.append(supplier)
+            else:
+                # בדיקה אם יש העברות
+                has_transfer = False
+                for row in rows:
+                    movement_type = str(row.get('סוג תנועה', '')).strip()
+                    if movement_type == 'העב':
+                        has_transfer = True
+                        break
+
+                if has_transfer:
+                    rule3_suppliers.append(supplier)
+
+    return rule1_suppliers, rule2_suppliers, rule3_suppliers
+
+def create_supplier_reconciliation_sheets(suppliers_list, rule_name):
+    """
+    יוצר DataFrame עבור גיליון התאמה
+    """
+    data = []
+    for supplier in suppliers_list:
+        data.append({
+            'מס\' ספק': supplier['account_num'],
+            'שם ספק': supplier['account_name'],
+            'חוב מצטבר': supplier['total_debt']
+        })
+
+    return pd.DataFrame(data)
+
+def identify_missing_transfers(suppliers: list, df_original: pd.DataFrame):
+    """
+    מזהה העברות שחסרות להן חשבוניות ומכין טיוטת מייל
+    """
+    missing_transfers = []
+
+    for supplier in suppliers:
+        for row in supplier['rows']:
+            movement_type = str(row.get('סוג תנועה', '')).strip()
+            if movement_type == 'העב':
+                transfer_date = row.get('תאריך תשלום', '')
+                transfer_amount = row.get('חוב לחשבונית', 0)
+
+                try:
+                    amount_val = float(str(transfer_amount).replace(',', '').replace('₪', ''))
+                    amount_val = abs(amount_val)  # סכום בערך מוחלט
+                except:
+                    amount_val = 0
+
+                missing_transfers.append({
+                    'מס\' ספק': supplier['account_num'],
+                    'שם ספק': supplier['account_name'],
+                    'תאריך העברה': transfer_date,
+                    'סכום העברה': amount_val,
+                    'טיוטת מייל': f"""שלום,
+אני מנהלת חשבונות של [שם לקוח].
+חסרה לי חשבונית עבור העברה מתאריך {transfer_date} בסכום {amount_val:.2f} ₪.
+אשמח לקבל חשבונית בהקדם.
+תודה"""
+                })
+
+    return pd.DataFrame(missing_transfers)
+
+def load_supplier_emails(email_file_bytes):
+    """
+    טוען קובץ עזר עם מיילים של ספקים
+    מצפה למבנה: מס' ספק | שם ספק | מייל ספק
+    """
+    try:
+        wb = load_workbook(io.BytesIO(email_file_bytes), data_only=True)
+        ws = wb.worksheets[0]
+        df = ws_to_df(ws)
+
+        # מציאת עמודות
+        email_map = {}
+        for idx, row in df.iterrows():
+            supplier_num = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
+            supplier_email = ""
+
+            # חיפוש עמודת מייל
+            for col_val in row:
+                if pd.notna(col_val) and '@' in str(col_val):
+                    supplier_email = str(col_val).strip()
+                    break
+
+            if supplier_num and supplier_email:
+                email_map[supplier_num] = supplier_email
+
+        return email_map
+    except Exception as e:
+        st.error(f"שגיאה בטעינת קובץ מיילים: {str(e)}")
+        return {}
+
+def send_email_smtp(smtp_server, smtp_port, sender_email, sender_password, recipient_email, subject, body, supplier_account=None):
+    """
+    שולח מייל דרך SMTP ומתעד במסד נתונים
+    """
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = sender_email
+        msg['To'] = recipient_email
+        msg['Subject'] = subject
+
+        msg.attach(MIMEText(body, 'plain', 'utf-8'))
+
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(sender_email, sender_password)
+            server.send_message(msg)
+
+        # Log to database
+        if supplier_account:
+            db.log_email(supplier_account, recipient_email, subject, body, "success")
+
+        return True, "נשלח בהצלחה"
+    except Exception as e:
+        # Log failure to database
+        if supplier_account:
+            db.log_email(supplier_account, recipient_email, subject, body, f"failed: {str(e)}")
+        return False, str(e)
+
+# ---------------- VLOOKUP store (using database) ----------------
 def build_vlookup_sheet(datasheet_df: pd.DataFrame) -> pd.DataFrame:
     """
     כל שורה → 'סכום חובה' = |סכום|.
     שורת סיכום 20001 בזכות = סה״כ חובה של השורות שיש להן 'מס' ספק'.
     שורות בלי 'מס' ספק' – יצבעו בכתום בשלב העיצוב.
     """
-    store = vk_load()
-    name_map   = {str(k): v for k, v in store.get("name_map", {}).items()}
-    amount_map = {float(k): v for k, v in store.get("amount_map", {}).items()}
+    # Load mappings from database
+    name_map = db.get_name_mappings()
+    amount_map = db.get_amount_mappings()
 
     col_match = pick_col(datasheet_df, MATCH_COLS) or datasheet_df.columns[0]
     col_bamt  = pick_col(datasheet_df, BANK_AMTS)
@@ -128,7 +374,11 @@ def build_vlookup_sheet(datasheet_df: pd.DataFrame) -> pd.DataFrame:
 
     match = pd.to_numeric(datasheet_df[col_match], errors="coerce").fillna(0).astype(int)
     bamt  = to_num(datasheet_df[col_bamt]) if col_bamt else pd.Series([np.nan]*len(datasheet_df))
-    det   = datasheet_df[col_det].astype(str).fillna("")
+    det   = datasheet_df[col_det].astype(str).fillna("") if col_det else pd.Series([""]*len(datasheet_df))
+
+    # בדיקה שיש עמודות נדרשות
+    if not col_det or not col_bamt:
+        return pd.DataFrame(columns=["פרטים","סכום","מס' ספק","סכום חובה","סכום זכות"])
 
     vk = datasheet_df.loc[match==2, [col_det, col_bamt]].rename(columns={col_det:"פרטים", col_bamt:"סכום"}).copy()
     if vk.empty:
@@ -395,8 +645,10 @@ def process_workbook(main_bytes: bytes, aux_bytes: bytes|None):
 # ---------------- UI ----------------
 c1, c2 = st.columns([2,2])
 main_file = c1.file_uploader("בחרי קובץ מקור – DataSheet בלבד", type=["xlsx"])
-aux_file  = c2.file_uploader("⬆️ קובץ עזר להעברות (לכלל 3)", type=["xlsx"])
-st.caption("VLOOKUP שומר מפות ב-rules_store.json (שם/סכום → מס' ספק).")
+aux_file  = c2.file_uploader("⬆️ קובץ עזר להעברות (לכלל 3)", type=["xlsx"],
+                             help="קובץ Excel עם פרטי העברות מהבנק (תאריך, סכום, מס' תשלום) לצורך התאמת כלל 3")
+st.caption("💡 קובץ עזר = קובץ ממערכת הבנק עם פירוט העברות (תאריך אירוע, אחרי ניכוי, מס' תשלום)")
+st.caption("VLOOKUP שומר מפות במסד נתונים (שם/סכום → מס' ספק).")
 
 if st.button("הרצה 1–12"):
     if not main_file:
@@ -418,19 +670,219 @@ if st.button("הרצה 1–12"):
 # ניהול מפות ל-VLOOKUP
 st.divider()
 st.subheader("🔎 VLOOKUP – הוראת קבע ספקים (עריכה ושמירה)")
-store = vk_load()
-with st.expander("מפות מיפוי (נשמר ל-rules_store.json)", expanded=False):
+with st.expander("מפות מיפוי (נשמר במסד נתונים)", expanded=False):
     t1, t2 = st.columns([2,1])
     nm = t1.text_input("מיפוי לפי 'פרטים' (contains)")
     sp = t2.text_input("מס' ספק")
     if st.button("➕ הוסף/עדכן לפי שם"):
         if nm and sp:
-            store["name_map"][nm] = sp; vk_save(store); st.success("נשמר לפי שם.")
+            db.save_name_mapping(nm, sp)
+            st.success("נשמר לפי שם במסד הנתונים.")
     t3, t4 = st.columns([1,1])
     amt = t3.number_input("מיפוי לפי סכום (ערך מוחלט)", step=0.01, format="%.2f")
     sp2 = t4.text_input("מס' ספק", key="vk2")
     if st.button("➕ הוסף/עדכן לפי סכום"):
         try:
-            store["amount_map"][str(round(abs(float(amt)),2))] = sp2; vk_save(store); st.success("נשמר לפי סכום.")
+            db.save_amount_mapping(abs(float(amt)), sp2)
+            st.success("נשמר לפי סכום במסד הנתונים.")
         except Exception as e:
             st.error(str(e))
+
+# ---------------- התאמות ספקים (גיול חובות) ----------------
+st.divider()
+st.header("📊 התאמות ספקים - גיול חובות")
+
+aging_file = st.file_uploader("העלאת קובץ גיול חובות ספקים", type=["xlsx"], key="aging")
+client_name_input = st.text_input("שם הלקוח (לשליחת מיילים)", value="")
+
+if st.button("🔍 נתח גיול חובות"):
+    if not aging_file:
+        st.error("נא להעלות קובץ גיול חובות")
+    else:
+        with st.spinner("מעבד גיול חובות..."):
+            try:
+                # קריאת קובץ
+                aging_wb = load_workbook(io.BytesIO(aging_file.read()), data_only=True)
+                aging_ws = aging_wb.worksheets[0]
+                aging_df = ws_to_df(aging_ws)
+
+                # ניתוח ספקים
+                suppliers = parse_supplier_aging(aging_df)
+
+                if not suppliers:
+                    st.error("לא נמצאו ספקים בקובץ")
+                else:
+                    # סיווג ספקים
+                    rule1, rule2, rule3 = classify_suppliers(suppliers)
+
+                    # יצירת גיליונות
+                    df_100 = create_supplier_reconciliation_sheets(rule1, "100% התאמה")
+                    df_80 = create_supplier_reconciliation_sheets(rule2, "80% התאמה")
+                    df_transfers = identify_missing_transfers(rule3, aging_df)
+
+                    # שמירת שם לקוח במייל אם צוין
+                    if client_name_input and not df_transfers.empty:
+                        df_transfers['טיוטת מייל'] = df_transfers['טיוטת מייל'].str.replace(
+                            '[שם לקוח]', client_name_input
+                        )
+
+                    # הצגת תוצאות
+                    st.success(f"נותחו {len(suppliers)} ספקים")
+
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("100% התאמה", len(rule1))
+                    with col2:
+                        st.metric("80% התאמה", len(rule2))
+                    with col3:
+                        st.metric("העברות חסרות", len(rule3))
+
+                    # תצוגת טבלאות
+                    if not df_100.empty:
+                        st.subheader("✅ 100% התאמה")
+                        st.dataframe(df_100, use_container_width=True)
+
+                    if not df_80.empty:
+                        st.subheader("⚠️ 80% התאמה")
+                        st.dataframe(df_80, use_container_width=True)
+
+                    if not df_transfers.empty:
+                        st.subheader("📧 העברות חסרות חשבונית (טיוטות מייל)")
+                        st.dataframe(df_transfers, use_container_width=True)
+
+                    # יצוא לקובץ Excel
+                    buffer = io.BytesIO()
+                    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+                        if not df_100.empty:
+                            df_100.to_excel(writer, index=False, sheet_name="100% התאמה")
+                        if not df_80.empty:
+                            df_80.to_excel(writer, index=False, sheet_name="80% התאמה")
+                        if not df_transfers.empty:
+                            df_transfers.to_excel(writer, index=False, sheet_name="העברות חסרות")
+
+                    wb_aging = load_workbook(io.BytesIO(buffer.getvalue()))
+                    style_and_print(wb_aging)
+                    final_aging = io.BytesIO()
+                    wb_aging.save(final_aging)
+
+                    st.download_button(
+                        "📥 הורד דוח התאמות ספקים",
+                        data=final_aging.getvalue(),
+                        file_name="התאמות_ספקים.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+
+                    # שמירת נתונים ב-session_state למייל
+                    st.session_state['transfers_for_email'] = df_transfers
+
+            except Exception as e:
+                st.error(f"שגיאה בעיבוד: {str(e)}")
+                import traceback
+                st.text(traceback.format_exc())
+
+# ---------------- שליחת מיילים אוטומטית ----------------
+st.divider()
+st.header("📧 שליחת מיילים אוטומטית לספקים")
+
+# טעינת קובץ עזר מיילים
+email_helper_file = st.file_uploader("העלאת קובץ עזר - מיילים של ספקים", type=["xlsx"], key="email_helper")
+
+# טעינת מיילים אם הועלה קובץ
+if email_helper_file:
+    email_map = load_supplier_emails(email_helper_file.read())
+    if email_map:
+        st.success(f"נטענו מיילים של {len(email_map)} ספקים")
+        st.session_state['supplier_emails'] = email_map
+
+if 'transfers_for_email' in st.session_state and not st.session_state['transfers_for_email'].empty:
+    df_emails = st.session_state['transfers_for_email']
+
+    st.info(f"נמצאו {len(df_emails)} העברות שדורשות מייל")
+
+    # הגדרות SMTP
+    with st.expander("⚙️ הגדרות מייל (SMTP)", expanded=False):
+        smtp_server = st.text_input("שרת SMTP", value="smtp.gmail.com")
+        smtp_port = st.number_input("פורט SMTP", value=587)
+        sender_email = st.text_input("כתובת מייל שולח")
+        sender_password = st.text_input("סיסמה", type="password")
+        email_subject = st.text_input("נושא המייל", value="בקשה לחשבונית - העברה")
+
+        if st.button("📨 שלח מיילים לכל הספקים"):
+            if not sender_email or not sender_password:
+                st.error("נא למלא כתובת מייל וסיסמה")
+            elif 'supplier_emails' not in st.session_state:
+                st.error("נא להעלות קובץ עזר עם מיילי ספקים")
+            else:
+                email_map = st.session_state['supplier_emails']
+                success_count = 0
+                fail_count = 0
+
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                for idx, row in df_emails.iterrows():
+                    supplier_num = str(row['מס\' ספק'])
+                    supplier_name = row['שם ספק']
+                    email_body = row['טיוטת מייל']
+
+                    # חיפוש מייל ספק
+                    recipient = email_map.get(supplier_num)
+
+                    if recipient:
+                        status_text.text(f"שולח מייל ל-{supplier_name}...")
+                        success, msg = send_email_smtp(
+                            smtp_server, smtp_port,
+                            sender_email, sender_password,
+                            recipient, email_subject, email_body,
+                            supplier_account=supplier_num
+                        )
+
+                        if success:
+                            success_count += 1
+                        else:
+                            fail_count += 1
+                            st.warning(f"נכשל לשלוח ל-{supplier_name}: {msg}")
+                    else:
+                        fail_count += 1
+                        st.warning(f"לא נמצא מייל עבור ספק {supplier_num} - {supplier_name}")
+
+                    progress_bar.progress((idx + 1) / len(df_emails))
+
+                status_text.text("")
+                st.success(f"✅ נשלחו {success_count} מיילים בהצלחה")
+                if fail_count > 0:
+                    st.error(f"❌ {fail_count} מיילים נכשלו")
+
+        # אפשרות לשליחה ידנית
+        st.subheader("שליחה ידנית למייל ספציפי")
+        manual_supplier = st.selectbox(
+            "בחר ספק",
+            options=range(len(df_emails)),
+            format_func=lambda x: "{} - {}".format(df_emails.iloc[x]['מס\' ספק'], df_emails.iloc[x]['שם ספק'])
+        )
+
+        if manual_supplier is not None:
+            selected_row = df_emails.iloc[manual_supplier]
+            manual_email = st.text_input("מייל נמען", value="")
+            st.text_area("תוכן המייל", value=selected_row['טיוטת מייל'], height=200)
+
+            if st.button("שלח מייל בודד"):
+                if not manual_email:
+                    st.error("נא להזין כתובת מייל")
+                elif not sender_email or not sender_password:
+                    st.error("נא להזין פרטי שולח")
+                else:
+                    success, msg = send_email_smtp(
+                        smtp_server, smtp_port,
+                        sender_email, sender_password,
+                        manual_email, email_subject,
+                        selected_row['טיוטת מייל'],
+                        supplier_account=selected_row['מס\' ספק']
+                    )
+                    if success:
+                        st.success("✅ המייל נשלח בהצלחה!")
+                    else:
+                        st.error(f"❌ שגיאה: {msg}")
+
+else:
+    st.info("יש להריץ תחילה ניתוח גיול חובות כדי לזהות העברות שדורשות מייל")
