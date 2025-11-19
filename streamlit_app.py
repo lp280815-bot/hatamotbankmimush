@@ -374,7 +374,11 @@ def build_vlookup_sheet(datasheet_df: pd.DataFrame) -> pd.DataFrame:
 
     match = pd.to_numeric(datasheet_df[col_match], errors="coerce").fillna(0).astype(int)
     bamt  = to_num(datasheet_df[col_bamt]) if col_bamt else pd.Series([np.nan]*len(datasheet_df))
-    det   = datasheet_df[col_det].astype(str).fillna("")
+    det   = datasheet_df[col_det].astype(str).fillna("") if col_det else pd.Series([""]*len(datasheet_df))
+
+    # בדיקה שיש עמודות נדרשות
+    if not col_det or not col_bamt:
+        return pd.DataFrame(columns=["פרטים","סכום","מס' ספק","סכום חובה","סכום זכות"])
 
     vk = datasheet_df.loc[match==2, [col_det, col_bamt]].rename(columns={col_det:"פרטים", col_bamt:"סכום"}).copy()
     if vk.empty:
@@ -641,7 +645,9 @@ def process_workbook(main_bytes: bytes, aux_bytes: bytes|None):
 # ---------------- UI ----------------
 c1, c2 = st.columns([2,2])
 main_file = c1.file_uploader("בחרי קובץ מקור – DataSheet בלבד", type=["xlsx"])
-aux_file  = c2.file_uploader("⬆️ קובץ עזר להעברות (לכלל 3)", type=["xlsx"])
+aux_file  = c2.file_uploader("⬆️ קובץ עזר להעברות (לכלל 3)", type=["xlsx"],
+                             help="קובץ Excel עם פרטי העברות מהבנק (תאריך, סכום, מס' תשלום) לצורך התאמת כלל 3")
+st.caption("💡 קובץ עזר = קובץ ממערכת הבנק עם פירוט העברות (תאריך אירוע, אחרי ניכוי, מס' תשלום)")
 st.caption("VLOOKUP שומר מפות במסד נתונים (שם/סכום → מס' ספק).")
 
 if st.button("הרצה 1–12"):
