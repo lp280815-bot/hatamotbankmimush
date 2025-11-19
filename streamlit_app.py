@@ -26,6 +26,20 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font
 from openpyxl.worksheet.page import PageMargins
 
+# Import database module
+import database as db
+
+# Initialize database on app start
+@st.cache_resource
+def init_app_database():
+    """Initialize database once per app session"""
+    db.init_database()
+    # Migrate from JSON if exists
+    db.migrate_from_json()
+    return True
+
+init_app_database()
+
 # ---------------- UI ----------------
 st.set_page_config(page_title="התאמות בנק – 1 עד 12", page_icon="✅", layout="centered")
 st.markdown("""
@@ -315,9 +329,9 @@ def load_supplier_emails(email_file_bytes):
         st.error(f"שגיאה בטעינת קובץ מיילים: {str(e)}")
         return {}
 
-def send_email_smtp(smtp_server, smtp_port, sender_email, sender_password, recipient_email, subject, body):
+def send_email_smtp(smtp_server, smtp_port, sender_email, sender_password, recipient_email, subject, body, supplier_account=None):
     """
-    שולח מייל דרך SMTP
+    שולח מייל דרך SMTP ומתעד במסד נתונים
     """
     try:
         msg = MIMEMultipart()
@@ -332,30 +346,27 @@ def send_email_smtp(smtp_server, smtp_port, sender_email, sender_password, recip
             server.login(sender_email, sender_password)
             server.send_message(msg)
 
+        # Log to database
+        if supplier_account:
+            db.log_email(supplier_account, recipient_email, subject, body, "success")
+
         return True, "נשלח בהצלחה"
     except Exception as e:
+        # Log failure to database
+        if supplier_account:
+            db.log_email(supplier_account, recipient_email, subject, body, f"failed: {str(e)}")
         return False, str(e)
 
-# ---------------- VLOOKUP store ----------------
-VK_FILE = "rules_store.json"
-def vk_load():
-    if os.path.exists(VK_FILE):
-        try:
-            with open(VK_FILE,"r",encoding="utf-8") as f: return json.load(f)
-        except Exception: pass
-    return {"name_map": {}, "amount_map": {}}
-def vk_save(store):
-    with open(VK_FILE,"w",encoding="utf-8") as f: json.dump(store,f,ensure_ascii=False,indent=2)
-
+# ---------------- VLOOKUP store (using database) ----------------
 def build_vlookup_sheet(datasheet_df: pd.DataFrame) -> pd.DataFrame:
     """
     כל שורה → 'סכום חובה' = |סכום|.
     שורת סיכום 20001 בזכות = סה״כ חובה של השורות שיש להן 'מס' ספק'.
     שורות בלי 'מס' ספק' – יצבעו בכתום בשלב העיצוב.
     """
-    store = vk_load()
-    name_map   = {str(k): v for k, v in store.get("name_map", {}).items()}
-    amount_map = {float(k): v for k, v in store.get("amount_map", {}).items()}
+    # Load mappings from database
+    name_map = db.get_name_mappings()
+    amount_map = db.get_amount_mappings()
 
     col_match = pick_col(datasheet_df, MATCH_COLS) or datasheet_df.columns[0]
     col_bamt  = pick_col(datasheet_df, BANK_AMTS)
@@ -631,7 +642,7 @@ def process_workbook(main_bytes: bytes, aux_bytes: bytes|None):
 c1, c2 = st.columns([2,2])
 main_file = c1.file_uploader("בחרי קובץ מקור – DataSheet בלבד", type=["xlsx"])
 aux_file  = c2.file_uploader("⬆️ קובץ עזר להעברות (לכלל 3)", type=["xlsx"])
-st.caption("VLOOKUP שומר מפות ב-rules_store.json (שם/סכום → מס' ספק).")
+st.caption("VLOOKUP שומר מפות במסד נתונים (שם/סכום → מס' ספק).")
 
 if st.button("הרצה 1–12"):
     if not main_file:
@@ -653,20 +664,21 @@ if st.button("הרצה 1–12"):
 # ניהול מפות ל-VLOOKUP
 st.divider()
 st.subheader("🔎 VLOOKUP – הוראת קבע ספקים (עריכה ושמירה)")
-store = vk_load()
-with st.expander("מפות מיפוי (נשמר ל-rules_store.json)", expanded=False):
+with st.expander("מפות מיפוי (נשמר במסד נתונים)", expanded=False):
     t1, t2 = st.columns([2,1])
     nm = t1.text_input("מיפוי לפי 'פרטים' (contains)")
     sp = t2.text_input("מס' ספק")
     if st.button("➕ הוסף/עדכן לפי שם"):
         if nm and sp:
-            store["name_map"][nm] = sp; vk_save(store); st.success("נשמר לפי שם.")
+            db.save_name_mapping(nm, sp)
+            st.success("נשמר לפי שם במסד הנתונים.")
     t3, t4 = st.columns([1,1])
     amt = t3.number_input("מיפוי לפי סכום (ערך מוחלט)", step=0.01, format="%.2f")
     sp2 = t4.text_input("מס' ספק", key="vk2")
     if st.button("➕ הוסף/עדכן לפי סכום"):
         try:
-            store["amount_map"][str(round(abs(float(amt)),2))] = sp2; vk_save(store); st.success("נשמר לפי סכום.")
+            db.save_amount_mapping(abs(float(amt)), sp2)
+            st.success("נשמר לפי סכום במסד הנתונים.")
         except Exception as e:
             st.error(str(e))
 
@@ -815,7 +827,8 @@ if 'transfers_for_email' in st.session_state and not st.session_state['transfers
                         success, msg = send_email_smtp(
                             smtp_server, smtp_port,
                             sender_email, sender_password,
-                            recipient, email_subject, email_body
+                            recipient, email_subject, email_body,
+                            supplier_account=supplier_num
                         )
 
                         if success:
@@ -857,7 +870,8 @@ if 'transfers_for_email' in st.session_state and not st.session_state['transfers
                         smtp_server, smtp_port,
                         sender_email, sender_password,
                         manual_email, email_subject,
-                        selected_row['טיוטת מייל']
+                        selected_row['טיוטת מייל'],
+                        supplier_account=selected_row['מס\' ספק']
                     )
                     if success:
                         st.success("✅ המייל נשלח בהצלחה!")
