@@ -10,7 +10,8 @@
     אין דרישת התאמת תאריך. אם אין התאמה → גיליון 'פערי סכומים – כלל 3'.
 - כלל 4: שיקים ספקים (493) עם טולרנס סכום על התאמת אסמכתאות (Ref1 בנק ↔ Ref2 ספרים).
 - כללים 5–10: לפי הלוגיקה שאישרת.
-- 11–12: placeholders.
+- כלל 11: התאמות BT (קוד 485 מול אסמכתא BT) – לפי סכום מוחלט.
+- 12: placeholder.
 - עיצוב: RTL, A4 לרוחב, Fit-to-width=1, שוליים נוחים.
 """
 
@@ -85,9 +86,86 @@ DEFAULT_NAME_MAP = {
     "הו\"ק הלו' רבית": "8004",
 }
 
-# placeholders 11–12
+# placeholders 11–12 (rule 11 overridden below)
 def rule11_placeholder(df, match_col, code_col, bamt_col, details_col):
-    return df[match_col]
+    """
+    כלל 11 – התאמות BT:
+    • צד בנק: קוד פעולת בנק = 485 וסכום בבנק ≠ 0.
+    • צד ספרים: אסמכתא 1 מתחילה ב-"BT" וסכום בספרים ≠ 0.
+    • התאמה היא 1:1 לפי סכום מוחלט (|סכום בנק| = |סכום ספרים|).
+    • אין דריסה של כללים – עובדים רק על שורות שמס' ההתאמה שלהן עדיין 0.
+    """
+
+    # אם אין עמודת מס' התאמה בכלל – לא נוגעים
+    if match_col not in df.columns:
+        return df.get(match_col, pd.Series([0] * len(df)))
+
+    # לנסות להשלים עמודות חסרות אם לא הגיעו מבחוץ
+    if not code_col:
+        code_col = pick_col(df, BANK_CODES)
+    if not bamt_col:
+        bamt_col = pick_col(df, BANK_AMTS)
+    ref1_col = pick_col(df, REF1S)
+    aamt_col = pick_col(df, BOOKS_AMTS)
+
+    # אם חסרה עמודת קוד / סכום / אסמכתא / סכום ספרים – אי אפשר להריץ את הכלל
+    if not code_col or not bamt_col or not ref1_col or not aamt_col:
+        return df[match_col]
+
+    # המרות בסיסיות
+    match = pd.to_numeric(df[match_col], errors="coerce").fillna(0).astype(int)
+    code  = to_num(df[code_col])
+    bamt  = to_num(df[bamt_col])
+    aamt  = to_num(df[aamt_col])
+    ref1  = df[ref1_col].astype(str).fillna("").str.strip()
+
+    # מילונים: סכום מוחלט -> רשימת אינדקסים
+    bank_by_amt  = {}
+    books_by_amt = {}
+
+    # צד בנק – קוד 485
+    for i in range(len(df)):
+        if match.iat[i] != 0:
+            continue
+        if pd.isna(code.iat[i]) or pd.isna(bamt.iat[i]) or bamt.iat[i] == 0:
+            continue
+        try:
+            if int(code.iat[i]) != 485:
+                continue
+        except Exception:
+            continue
+
+        key = round(abs(float(bamt.iat[i])), 2)
+        bank_by_amt.setdefault(key, []).append(i)
+
+    # צד ספרים – אסמכתא 1 מתחילה ב-BT
+    for j in range(len(df)):
+        if match.iat[j] != 0:
+            continue
+        if pd.isna(aamt.iat[j]) or aamt.iat[j] == 0:
+            continue
+        if not str(ref1.iat[j]).upper().startswith("BT"):
+            continue
+
+        key = round(abs(float(aamt.iat[j])), 2)
+        books_by_amt.setdefault(key, []).append(j)
+
+    # התאמות 1:1 לפי סכום מוחלט
+    for key, bank_idx_list in bank_by_amt.items():
+        books_idx_list = books_by_amt.get(key, [])
+        if not books_idx_list:
+            continue
+
+        pair_count = min(len(bank_idx_list), len(books_idx_list))
+        for k in range(pair_count):
+            i = bank_idx_list[k]
+            j = books_idx_list[k]
+            if match.iat[i] == 0 and match.iat[j] == 0:
+                match.iat[i] = 11
+                match.iat[j] = 11
+
+    return match
+
 
 def rule12_placeholder(df, match_col, code_col, bamt_col, details_col):
     return df[match_col]
@@ -120,10 +198,10 @@ def pick_col(df, names):
 
 def to_num(s):
     s = (s.astype(str)
-         .str.replace(",", "", regex=False)
-         .str.replace("₪", "", regex=False)
-         .str.replace("\u200f", "", regex=False)
-         .str.replace("\u200e", "", regex=False)
+         .str.replace(",","",regex=False)
+         .str.replace("₪","",regex=False)
+         .str.replace("\u200f","",regex=False)
+         .str.replace("\u200e","",regex=False)
          .str.strip())
     return pd.to_numeric(s, errors="coerce")
 
@@ -141,11 +219,11 @@ def ws_to_df(ws):
     if not rows:
         return pd.DataFrame()
     header = [str(x) if x is not None else "" for x in rows[0]]
-    data = [list(r[:len(header)]) for r in rows[1:]]
+    data   = [list(r[:len(header)]) for r in rows[1:]]
     return pd.DataFrame(data, columns=header)
 
 def only_digits(s):
-    return re.sub(r"\D", "", str(s)).lstrip("0") or "0"
+    return re.sub(r"\D","", str(s)).lstrip("0") or "0"
 
 # ---------------- VLOOKUP store ----------------
 def vk_load():
@@ -167,8 +245,6 @@ def vk_load():
     for k, v in DEFAULT_NAME_MAP.items():
         store["name_map"].setdefault(k, v)
 
-    # נשמור בחזרה כדי שהקובץ תמיד יכיל גם את ברירת המחדל
-    vk_save(store)
     return store
 
 def vk_save(store):
@@ -203,7 +279,8 @@ def import_name_map_from_excel(file, store):
             store["name_map"][name] = sup
             added += 1
 
-    vk_save(store)
+    if added:
+        vk_save(store)
     return added
 
 def build_vlookup_sheet(datasheet_df: pd.DataFrame) -> pd.DataFrame:
@@ -222,22 +299,17 @@ def build_vlookup_sheet(datasheet_df: pd.DataFrame) -> pd.DataFrame:
 
     match = pd.to_numeric(datasheet_df[col_match], errors="coerce").fillna(0).astype(int)
     bamt  = to_num(datasheet_df[col_bamt]) if col_bamt else pd.Series([np.nan] * len(datasheet_df))
-    det   = datasheet_df[col_det].astype(str).fillna("")
+    det   = datasheet_df[col_det].astype(str).fillna("") if col_det else pd.Series([""] * len(datasheet_df))
 
-    vk = datasheet_df.loc[match == 2, [col_det, col_bamt]].rename(
-        columns={col_det: "פרטים", col_bamt: "סכום"}
-    ).copy()
-
+    vk = datasheet_df.loc[match == 2, [col_det, col_bamt]].rename(columns={col_det: "פרטים", col_bamt: "סכום"}).copy()
     if vk.empty:
         return pd.DataFrame(columns=["פרטים", "סכום", "מס' ספק", "סכום חובה", "סכום זכות"])
 
     def pick_supplier(row):
         s = str(row["פרטים"])
-        # קודם לפי טקסט
         for k, v in name_map.items():
             if k and k in s:
                 return v
-        # אחר כך לפי סכום מוחלט
         try:
             key = round(abs(float(row["סכום"])), 2)
             return amount_map.get(key, "")
@@ -248,28 +320,15 @@ def build_vlookup_sheet(datasheet_df: pd.DataFrame) -> pd.DataFrame:
     vk["סכום חובה"] = vk["סכום"].apply(lambda x: abs(x) if pd.notna(x) else 0.0)
     vk["סכום זכות"] = 0.0
 
-    total_hova_with_supplier = vk.loc[
-        vk["מס' ספק"].astype(str).str.len() > 0, "סכום חובה"
-    ].sum()
-
+    total_hova_with_supplier = vk.loc[vk["מס' ספק"].astype(str).str.len() > 0, "סכום חובה"].sum()
     if total_hova_with_supplier and total_hova_with_supplier != 0:
-        vk = pd.concat(
-            [
-                vk,
-                pd.DataFrame(
-                    [
-                        {
-                            "פרטים": "סה\"כ זכות – עם מס' ספק",
-                            "סכום": 0.0,
-                            "מס' ספק": 20001,
-                            "סכום חובה": 0.0,
-                            "סכום זכות": round(float(total_hova_with_supplier), 2),
-                        }
-                    ]
-                ),
-            ],
-            ignore_index=True,
-        )
+        vk = pd.concat([vk, pd.DataFrame([{
+            "פרטים": "סה\"כ זכות – עם מס' ספק",
+            "סכום": 0.0,
+            "מס' ספק": 20001,
+            "סכום חובה": 0.0,
+            "סכום זכות": round(float(total_hova_with_supplier), 2)
+        }])], ignore_index=True)
 
     return vk
 
@@ -289,41 +348,28 @@ def apply_rules_1_4(df: pd.DataFrame) -> pd.DataFrame:
         out[col_match] = 0
 
     match = pd.to_numeric(out[col_match], errors="coerce").fillna(0).astype(int)
-    code  = to_num(out[col_code]) if col_code else pd.Series([np.nan]*len(out))
-    bamt  = to_num(out[col_bamt]) if col_bamt else pd.Series([np.nan]*len(out))
-    aamt  = to_num(out[col_aamt]) if col_aamt else pd.Series([np.nan]*len(out))
-    datev = norm_date(pd.to_datetime(out[col_date], errors="coerce")) if col_date else pd.Series([pd.NaT]*len(out))
-    det   = out[col_det].astype(str).fillna("") if col_det else pd.Series([""]*len(out))
-    ref1  = out[col_ref1].astype(str).fillna("") if col_ref1 else pd.Series([""]*len(out))
-    ref2  = out[col_ref2].astype(str).fillna("") if col_ref2 else pd.Series([""]*len(out))
+    code  = to_num(out[col_code]) if col_code else pd.Series([np.nan] * len(out))
+    bamt  = to_num(out[col_bamt]) if col_bamt else pd.Series([np.nan] * len(out))
+    aamt  = to_num(out[col_aamt]) if col_aamt else pd.Series([np.nan] * len(out))
+    datev = norm_date(pd.to_datetime(out[col_date], errors="coerce")) if col_date else pd.Series([pd.NaT] * len(out))
+    det   = out[col_det].astype(str).fillna("") if col_det else pd.Series([""] * len(out))
+    ref1  = out[col_ref1].astype(str).fillna("") if col_ref1 else pd.Series([""] * len(out))
+    ref2  = out[col_ref2].astype(str).fillna("") if col_ref2 else pd.Series([""] * len(out))
 
     # 1: OV/RC 1:1
     bank_keys, books_keys = {}, {}
     for i in range(len(out)):
         if match.iat[i] != 0:
             continue
-        if (
-            pd.notna(code.iat[i])
-            and int(code.iat[i]) in OVRC_CODES
-            and pd.notna(bamt.iat[i])
-            and bamt.iat[i] < 0
-            and pd.notna(datev.iat[i])
-        ):
+        if pd.notna(code.iat[i]) and int(code.iat[i]) in OVRC_CODES and pd.notna(bamt.iat[i]) and bamt.iat[i] < 0 and pd.notna(datev.iat[i]):
             k = (round(abs(float(bamt.iat[i])), 2), datev.iat[i])
             bank_keys.setdefault(k, []).append(i)
-
     for j in range(len(out)):
         if match.iat[j] != 0:
             continue
-        if (
-            pd.notna(aamt.iat[j])
-            and aamt.iat[j] > 0
-            and pd.notna(datev.iat[j])
-            and str(ref1.iat[j]).upper().startswith(("OV", "RC"))
-        ):
+        if pd.notna(aamt.iat[j]) and aamt.iat[j] > 0 and pd.notna(datev.iat[j]) and str(ref1.iat[j]).upper().startswith(("OV", "RC")):
             k = (round(abs(float(aamt.iat[j])), 2), datev.iat[j])
             books_keys.setdefault(k, []).append(j)
-
     for k, bidx in bank_keys.items():
         if len(bidx) == 1 and len(books_keys.get(k, [])) == 1:
             i = bidx[0]
@@ -340,21 +386,12 @@ def apply_rules_1_4(df: pd.DataFrame) -> pd.DataFrame:
     # 3: יסומן בשלב process_workbook (תלוי עזר; ללא בדיקת תאריך)
 
     # 4: שיקים ספקים (Ref1 בנק ↔ Ref2 ספרים) + טולרנס
-    bank_idx = [
-        i for i in range(len(out))
-        if match.iat[i] == 0
-        and pd.notna(code.iat[i])
-        and int(code.iat[i]) == RULE4_CODE
-        and str(ref1.iat[i]).strip()
-        and pd.notna(bamt.iat[i])
-    ]
-    books_idx = [
-        j for j in range(len(out))
-        if match.iat[j] == 0
-        and str(ref1.iat[j]).upper().startswith("CH")
-        and str(ref2.iat[j]).strip()
-        and pd.notna(aamt.iat[j])
-    ]
+    bank_idx = [i for i in range(len(out))
+                if match.iat[i] == 0 and pd.notna(code.iat[i]) and int(code.iat[i]) == RULE4_CODE
+                and str(ref1.iat[i]).strip() and pd.notna(bamt.iat[i])]
+    books_idx = [j for j in range(len(out))
+                 if match.iat[j] == 0 and str(ref1.iat[j]).upper().startswith("CH")
+                 and str(ref2.iat[j]).strip() and pd.notna(aamt.iat[j])]
     used = set()
     for i in bank_idx:
         ref_b = only_digits(ref1.iat[i])
@@ -407,10 +444,19 @@ def apply_rules_5_12(df: pd.DataFrame) -> pd.DataFrame:
     m10 = (match == 0) & (code.isin(list(RULE10_CODES))) & (bamt.notna()) & (bamt != 0)
     match.loc[m10] = 10
 
-    match = rule11_placeholder(out.assign(**{col_match: match}), col_match, pick_col(out, BANK_CODES),
-                               pick_col(out, BANK_AMTS), pick_col(out, DETAILS))
-    match = rule12_placeholder(out.assign(**{col_match: match}), col_match, pick_col(out, BANK_CODES),
-                               pick_col(out, BANK_AMTS), pick_col(out, DETAILS))
+    # כלל 11 – אחרי 5–10, רק על שורות שמס. התאמה עדיין 0
+    match = rule11_placeholder(out.assign(**{col_match: match}),
+                               col_match,
+                               pick_col(out, BANK_CODES),
+                               pick_col(out, BANK_AMTS),
+                               pick_col(out, DETAILS))
+
+    # כלל 12 – כרגע placeholder
+    match = rule12_placeholder(out.assign(**{col_match: match}),
+                               col_match,
+                               pick_col(out, BANK_CODES),
+                               pick_col(out, BANK_AMTS),
+                               pick_col(out, DETAILS))
 
     out[col_match] = match
     return out
@@ -523,7 +569,7 @@ def process_workbook(main_bytes: bytes, aux_bytes: bytes | None):
                             "סכום בספרים (סיכום)": float(books_sum),
                             "פער |ספרים|-|עזר|": float(round(abs(abs(books_sum) - abs(evt_sum)), 2)),
                             "count_בנק": len(bank_idx),
-                            "count_ספרים": len(books_idx),
+                            "count_ספרים": len(books_idx)
                         })
                 else:
                     mismatches.append({
@@ -532,7 +578,7 @@ def process_workbook(main_bytes: bytes, aux_bytes: bytes | None):
                         "סכום בספרים (סיכום)": float(books_sum) if books_idx else np.nan,
                         "פער |ספרים|-|עזר|": np.nan,
                         "count_בנק": len(bank_idx),
-                        "count_ספרים": len(books_idx),
+                        "count_ספרים": len(books_idx)
                     })
 
             df[col_match] = match
@@ -549,13 +595,9 @@ def process_workbook(main_bytes: bytes, aux_bytes: bytes | None):
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as wr:
         df.to_excel(wr, index=False, sheet_name="DataSheet")
-        counts = pd.to_numeric(
-            df[pick_col(df, MATCH_COLS) or df.columns[0]],
-            errors="coerce"
-        ).fillna(0).astype(int).value_counts().sort_index()
-        pd.DataFrame({"מס": counts.index, "כמות": counts.values}).to_excel(
-            wr, index=False, sheet_name="סיכום"
-        )
+        counts = pd.to_numeric(df[pick_col(df, MATCH_COLS) or df.columns[0]],
+                               errors="coerce").fillna(0).astype(int).value_counts().sort_index()
+        pd.DataFrame({"מס": counts.index, "כמות": counts.values}).to_excel(wr, index=False, sheet_name="סיכום")
         vk_df.to_excel(wr, index=False, sheet_name="הוראת קבע ספקים")
 
         misdf = st.session_state.get("_rule3_mismatches_df", None)
@@ -579,35 +621,24 @@ if st.button("הרצה 1–12"):
         st.error("נא להעלות קובץ מקור.")
     else:
         with st.spinner("מעבד..."):
-            df_out, vk_out, out_bytes = process_workbook(
-                main_file.read(), aux_file.read() if aux_file else None
-            )
+            df_out, vk_out, out_bytes = process_workbook(main_file.read(), aux_file.read() if aux_file else None)
         if df_out is None:
             st.error("לא נמצאו נתונים.")
         else:
             st.success("מוכן!")
             col_match = pick_col(df_out, MATCH_COLS) or df_out.columns[0]
-            cnt = pd.to_numeric(
-                df_out[col_match], errors="coerce"
-            ).fillna(0).astype(int).value_counts().sort_index()
-            st.dataframe(
-                pd.DataFrame({"מס": cnt.index, "כמות": cnt.values}),
-                use_container_width=True,
-            )
-            st.download_button(
-                "📥 הורד קובץ מעודכן",
-                data=out_bytes,
-                file_name="התאמות_1_עד_12.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            cnt = pd.to_numeric(df_out[col_match], errors="coerce").fillna(0).astype(int).value_counts().sort_index()
+            st.dataframe(pd.DataFrame({"מס": cnt.index, "כמות": cnt.values}), use_container_width=True)
+            st.download_button("📥 הורד קובץ מעודכן",
+                               data=out_bytes,
+                               file_name="התאמות_1_עד_12.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # ניהול מפות ל-VLOOKUP
 st.divider()
-st.subheader("🔎 VLOOKUP – הוראת קבע ספקים (עריכה, שמירה וייבוא מאקסל)")
+st.subheader("🔎 VLOOKUP – הוראת קבע ספקים (עריכה ושמירה)")
 store = vk_load()
-
 with st.expander("מפות מיפוי (נשמר ל-rules_store.json)", expanded=False):
-    # הוספה/עדכון לפי שם (contains)
     t1, t2 = st.columns([2, 1])
     nm = t1.text_input("מיפוי לפי 'פרטים' (contains)")
     sp = t2.text_input("מס' ספק")
@@ -616,8 +647,6 @@ with st.expander("מפות מיפוי (נשמר ל-rules_store.json)", expanded=
             store["name_map"][nm] = sp
             vk_save(store)
             st.success("נשמר לפי שם.")
-
-    # הוספה/עדכון לפי סכום מוחלט
     t3, t4 = st.columns([1, 1])
     amt = t3.number_input("מיפוי לפי סכום (ערך מוחלט)", step=0.01, format="%.2f")
     sp2 = t4.text_input("מס' ספק", key="vk2")
@@ -629,92 +658,11 @@ with st.expander("מפות מיפוי (נשמר ל-rules_store.json)", expanded=
         except Exception as e:
             st.error(str(e))
 
-    # ייבוא מאקסל – פרטים + מס' ספק
-    st.markdown("---")
-    up_map = st.file_uploader(
-        "ייבוא קובץ מיפוי ספקים (עמודה 1 – פרטים, עמודה 2 – מס' ספק)",
-        type=["xlsx"],
-        key="vk_upload",
-    )
-    if up_map is not None and st.button("⬆️ ייבוא מיפוי מאקסל"):
+    st.markdown("**ייבוא מאקסל – רשימת ספקים (פרטים + מס' ספק):**")
+    upload_excel = st.file_uploader("טעינת קובץ מיפוי ספקים מאקסל", type=["xlsx", "xls"], key="vk_excel")
+    if upload_excel is not None:
         try:
-            added = import_name_map_from_excel(up_map, store)
-            st.success(f"התווספו/עודכנו {added} רשומות מהמיפוי.")
+            added = import_name_map_from_excel(upload_excel, store)
+            st.success(f"הייבוא הסתיים. נוספו/עודכנו {added} רשומות.")
         except Exception as e:
             st.error(f"שגיאה בייבוא: {e}")
-def rule11_placeholder(df, match_col, code_col, bamt_col, details_col):
-    """
-    כלל 11 – התאמות BT:
-    צד בנק: קוד פעולת בנק = 485
-    צד ספרים: אסמכתא 1 מתחילה ב-'BT'
-    התאמה 1:1 לפי סכום מוחלט, רק כשמס.התאמה עדיין 0 (ללא דריסה).
-    """
-
-    # אם חסר אחד מהעמודות – לא עושים כלום
-    if match_col not in df.columns:
-        return df[match_col]
-
-    # אם לא הועבר שם עמודת קוד/סכום – ננסה לאתר לבד
-    if not code_col:
-        code_col = pick_col(df, BANK_CODES)
-    if not bamt_col:
-        bamt_col = pick_col(df, BANK_AMTS)
-
-    ref1_col = pick_col(df, REF1S)
-    aamt_col = pick_col(df, BOOKS_AMTS)
-
-    if not code_col or not bamt_col or not ref1_col or not aamt_col:
-        # חסר מידע חיוני לכלל 11 – לא משנים
-        return df[match_col]
-
-    # המרות בסיסיות
-    match = pd.to_numeric(df[match_col], errors="coerce").fillna(0).astype(int)
-    code  = to_num(df[code_col])
-    bamt  = to_num(df[bamt_col])
-    aamt  = to_num(df[aamt_col])
-    ref1  = df[ref1_col].astype(str).str.strip()
-
-    # בניית אינדקסים לפי סכום מוחלט
-    bank_by_amt  = {}  # amount -> list of indices (צד בנק)
-    books_by_amt = {}  # amount -> list of indices (צד ספרים)
-
-    for i in range(len(df)):
-        # צד בנק – קוד 485
-        if match.iat[i] != 0:
-            continue
-        if pd.isna(code.iat[i]) or pd.isna(bamt.iat[i]):
-            continue
-        if int(code.iat[i]) != 485 or bamt.iat[i] == 0:
-            continue
-
-        key = round(abs(float(bamt.iat[i])), 2)
-        bank_by_amt.setdefault(key, []).append(i)
-
-    for j in range(len(df)):
-        # צד ספרים – אסמכתא מתחילה ב-BT
-        if match.iat[j] != 0:
-            continue
-        if pd.isna(aamt.iat[j]) or aamt.iat[j] == 0:
-            continue
-        if not str(ref1.iat[j]).upper().startswith("BT"):
-            continue
-
-        key = round(abs(float(aamt.iat[j])), 2)
-        books_by_amt.setdefault(key, []).append(j)
-
-    # התאמה 1:1 לפי סכום
-    for key, bank_idx_list in bank_by_amt.items():
-        books_idx_list = books_by_amt.get(key, [])
-        if not books_idx_list:
-            continue
-
-        pair_count = min(len(bank_idx_list), len(books_idx_list))
-        for k in range(pair_count):
-            i = bank_idx_list[k]
-            j = books_idx_list[k]
-
-            if match.iat[i] == 0 and match.iat[j] == 0:
-                match.iat[i] = 11
-                match.iat[j] = 11
-
-    return match
