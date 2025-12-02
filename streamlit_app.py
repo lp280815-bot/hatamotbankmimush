@@ -642,3 +642,79 @@ with st.expander("מפות מיפוי (נשמר ל-rules_store.json)", expanded=
             st.success(f"התווספו/עודכנו {added} רשומות מהמיפוי.")
         except Exception as e:
             st.error(f"שגיאה בייבוא: {e}")
+def rule11_placeholder(df, match_col, code_col, bamt_col, details_col):
+    """
+    כלל 11 – התאמות BT:
+    צד בנק: קוד פעולת בנק = 485
+    צד ספרים: אסמכתא 1 מתחילה ב-'BT'
+    התאמה 1:1 לפי סכום מוחלט, רק כשמס.התאמה עדיין 0 (ללא דריסה).
+    """
+
+    # אם חסר אחד מהעמודות – לא עושים כלום
+    if match_col not in df.columns:
+        return df[match_col]
+
+    # אם לא הועבר שם עמודת קוד/סכום – ננסה לאתר לבד
+    if not code_col:
+        code_col = pick_col(df, BANK_CODES)
+    if not bamt_col:
+        bamt_col = pick_col(df, BANK_AMTS)
+
+    ref1_col = pick_col(df, REF1S)
+    aamt_col = pick_col(df, BOOKS_AMTS)
+
+    if not code_col or not bamt_col or not ref1_col or not aamt_col:
+        # חסר מידע חיוני לכלל 11 – לא משנים
+        return df[match_col]
+
+    # המרות בסיסיות
+    match = pd.to_numeric(df[match_col], errors="coerce").fillna(0).astype(int)
+    code  = to_num(df[code_col])
+    bamt  = to_num(df[bamt_col])
+    aamt  = to_num(df[aamt_col])
+    ref1  = df[ref1_col].astype(str).str.strip()
+
+    # בניית אינדקסים לפי סכום מוחלט
+    bank_by_amt  = {}  # amount -> list of indices (צד בנק)
+    books_by_amt = {}  # amount -> list of indices (צד ספרים)
+
+    for i in range(len(df)):
+        # צד בנק – קוד 485
+        if match.iat[i] != 0:
+            continue
+        if pd.isna(code.iat[i]) or pd.isna(bamt.iat[i]):
+            continue
+        if int(code.iat[i]) != 485 or bamt.iat[i] == 0:
+            continue
+
+        key = round(abs(float(bamt.iat[i])), 2)
+        bank_by_amt.setdefault(key, []).append(i)
+
+    for j in range(len(df)):
+        # צד ספרים – אסמכתא מתחילה ב-BT
+        if match.iat[j] != 0:
+            continue
+        if pd.isna(aamt.iat[j]) or aamt.iat[j] == 0:
+            continue
+        if not str(ref1.iat[j]).upper().startswith("BT"):
+            continue
+
+        key = round(abs(float(aamt.iat[j])), 2)
+        books_by_amt.setdefault(key, []).append(j)
+
+    # התאמה 1:1 לפי סכום
+    for key, bank_idx_list in bank_by_amt.items():
+        books_idx_list = books_by_amt.get(key, [])
+        if not books_idx_list:
+            continue
+
+        pair_count = min(len(bank_idx_list), len(books_idx_list))
+        for k in range(pair_count):
+            i = bank_idx_list[k]
+            j = books_idx_list[k]
+
+            if match.iat[i] == 0 and match.iat[j] == 0:
+                match.iat[i] = 11
+                match.iat[j] = 11
+
+    return match
